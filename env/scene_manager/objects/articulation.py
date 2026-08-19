@@ -235,6 +235,7 @@ class ArticulationObject(SingleArticulation):
         self.upper_joint_positions = self.dof_properties["upper"].copy()
         self.lower_joint_positions = self.dof_properties["lower"].copy()
         self.initial_joint_positions = self.get_current_joint_positions()
+        self.initial_drive_targets = self._capture_drive_targets()
         self.app = omni.kit.app.get_app()
         self.app.update()
 
@@ -259,6 +260,8 @@ class ArticulationObject(SingleArticulation):
 
     def apply_saved_pose(self):
         self.set_current_joint_positions(self.initial_joint_positions)
+        if self.physics_cfg.get("reset_drive", False):
+            self.reset_drive_targets()
         pos = self.default_pos
         ori = self.default_ori
         scale = self.init_scale
@@ -283,6 +286,8 @@ class ArticulationObject(SingleArticulation):
             _FAR_CENTER[2] + random.uniform(-_FAR_JITTER, _FAR_JITTER),
         )
         self.set_current_joint_positions(self.initial_joint_positions)
+        if self.physics_cfg.get("reset_drive", False):
+            self.reset_drive_targets()
         ori = self.default_ori
         scale = self.init_scale
         self.set_local_pose(pos, ori)
@@ -365,6 +370,59 @@ class ArticulationObject(SingleArticulation):
         )
         pose = np.concatenate([pos_world, quat_wxyz], axis=0)
         return pose
+
+    def _get_joint_drive_type(self, joint_prim) -> str:
+        """Infer the DriveAPI token ('linear' or 'angular') for a joint prim."""
+        if joint_prim.IsA(UsdPhysics.PrismaticJoint):
+            return "linear"
+        if joint_prim.IsA(UsdPhysics.RevoluteJoint):
+            return "angular"
+        for drive_type in ("linear", "angular"):
+            if joint_prim.HasAPI(UsdPhysics.DriveAPI, drive_type):
+                return drive_type
+        return "linear"
+
+    def _iter_drive_joint_prims(self):
+        """Yield (joint_prim, drive_type) for every joint with a DriveAPI."""
+        root_prim = get_prim_at_path(self._prim_path)
+        if root_prim is None or not root_prim.IsValid():
+            raise ValueError(f"Invalid articulation root path: {self._prim_path}")
+
+        for prim in Usd.PrimRange(root_prim):
+            if not (
+                prim.IsA(UsdPhysics.PrismaticJoint)
+                or prim.IsA(UsdPhysics.RevoluteJoint)
+                or prim.IsA(UsdPhysics.Joint)
+            ):
+                continue
+            drive_type = self._get_joint_drive_type(prim)
+            if prim.HasAPI(UsdPhysics.DriveAPI, drive_type):
+                yield prim, drive_type
+
+    def _capture_drive_targets(self) -> dict:
+        """Snapshot the current drive target position of every drivable joint."""
+        targets = {}
+        for joint_prim, drive_type in self._iter_drive_joint_prims():
+            drive_api = UsdPhysics.DriveAPI.Get(joint_prim, drive_type)
+            target_attr = drive_api.GetTargetPositionAttr()
+            if target_attr:
+                targets[joint_prim.GetPath().pathString] = target_attr.Get()
+        return targets
+
+    def reset_drive_targets(self):
+        """Reset every joint's DriveAPI target position back to its initial value."""
+        for path, value in self.initial_drive_targets.items():
+            joint_prim = get_prim_at_path(path)
+            if joint_prim is None or not joint_prim.IsValid():
+                continue
+            drive_type = self._get_joint_drive_type(joint_prim)
+            drive_api = UsdPhysics.DriveAPI.Get(joint_prim, drive_type)
+            if not drive_api:
+                continue
+            target_attr = drive_api.GetTargetPositionAttr()
+            if not target_attr:
+                target_attr = drive_api.CreateTargetPositionAttr()
+            target_attr.Set(value)
 
     def get_joint_info(self, joint_name: str = "button_joint"):
         if joint_name not in self.dof_names:
