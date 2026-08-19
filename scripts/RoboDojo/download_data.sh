@@ -47,6 +47,7 @@ Available data formats:
                      values and do not include end-effector (ee) values.
   hdf5          523GB  HDF5 format. Contains the full RoboDojo data, including
                      all available state/action fields.
+  demo           1.5GB  Small HDF5 demo bundle. Folder: demo.
   depth          4.5TB  HDF5 with depth observations. Folder: RoboDojo_depth.
                      Availability depends on source.
   real           273GB  Real-world dataset for testing and evaluation.
@@ -121,6 +122,11 @@ resolve_data_type() {
       DATA_SIZE="523GB"
       DATA_DESCRIPTION="HDF5, full RoboDojo data with all available fields"
       DATA_DIR_NAME="RoboDojo"
+      ;;
+    demo)
+      DATA_SIZE="1.5GB"
+      DATA_DESCRIPTION="Small HDF5 demo bundle"
+      DATA_DIR_NAME="demo"
       ;;
     depth|RoboDojo_depth|hdf5_w_depth)
       DATA_TYPE="depth"

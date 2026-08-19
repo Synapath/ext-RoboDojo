@@ -32,6 +32,10 @@ Usage:
 Examples:
   bash scripts/RoboDojo/download_ckpt.sh huggingface Pi_0
   bash scripts/RoboDojo/download_ckpt.sh modelscope pi_0  # case-insensitive match
+  bash scripts/RoboDojo/download_ckpt.sh huggingface G05
+  bash scripts/RoboDojo/download_ckpt.sh modelscope G05
+  bash scripts/RoboDojo/download_ckpt.sh huggingface VLAct
+  bash scripts/RoboDojo/download_ckpt.sh modelscope VLAct
 
 The selected policy is downloaded to:
   XPolicyLab/policy/<POLICY>/checkpoints
@@ -129,6 +133,7 @@ declare -A POLICY_NAME_MAP=(
   [go1]="GO1"
   [gr00tn17]="GR00T_N17"
   [galaxeavla]="GalaxeaVLA"
+  [g05]="G05"
   [gigaworldpolicy]="GigaWorldPolicy"
   [hrdt]="H_RDT"
   [internvlaa1]="InternVLA_A1"
@@ -142,6 +147,8 @@ declare -A POLICY_NAME_MAP=(
   [smolvla]="SmolVLA"
   [spiritv15]="Spirit_v15"
   [starvlaalpha]="starVLA"
+  # VLAct OFT ckpts share the starVLA adapter (same pattern as StarVla_alpha).
+  [vlact]="starVLA"
   [xvla]="X_VLA"
   [xwam]="X_WAM"
   [xiaomirobotics0]="Xiaomi_Robotics_0"
