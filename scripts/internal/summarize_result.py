@@ -14,6 +14,9 @@ Rules:
     (matched by policy + embodiment + seed) and merge them into 50.
   * Every other (non `_random`) task is "standalone": we take the first 50.
   * `_random` tasks are not reported on their own; they only feed their base.
+  * The Generalization section additionally lists each of the 12 tasks as
+    separate 25-episode standard and `_random` rows. This is extra output
+    only and does not change the merged 50-episode scores used elsewhere.
   * A cell is filled only when the required episode count is present in JSON
     (50 for standalone, 25+25 for paired); otherwise the cell stays blank.
   * Each policy table lists seeds 0, 1, 2; incomplete cells are left blank.
@@ -25,6 +28,10 @@ Rules:
     completed cells so far (partial averages when incomplete).
   * success_rate = successes / count * 100
     score        = sum(scores) / count * 100
+  * For the timestamp folders whose results are included in the summary, the
+    script verifies that every `_result.json` detail record has all three
+    camera videos (`head`, `left_wrist`, and `right_wrist`). Mismatches are
+    reported only in the terminal.
 """
 
 import json
@@ -40,6 +47,12 @@ ROOT = os.environ.get(
 OUTPUT_MD = os.path.join(ROOT, "_summary.md")
 
 SEED_RE = re.compile(r"^(\d+)_")
+VIDEO_EPISODE_RE = re.compile(r"^episode_(\d+)(?:_|$)")
+VIDEO_CAMERA_RE = re.compile(
+    r"^episode_(\d+)_cam_(head|left_wrist|right_wrist)(?:_|$)"
+)
+VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+EXPECTED_CAMERAS = {"head", "left_wrist", "right_wrist"}
 STANDALONE_EPISODES = 50
 PAIRED_HALF_EPISODES = 25
 EXPECTED_SEEDS = [0, 1, 2]
@@ -99,6 +112,136 @@ def latest_timestamp_dir(run_dir):
         return None
     # Timestamp format `YYYY-MM-DD_HH-MM-SS` sorts chronologically as a string.
     return os.path.join(run_dir, sorted(candidates)[-1])
+
+
+def result_record_ids(ts_dir):
+    """Return normalized detail-record ids, or None for missing/invalid JSON."""
+    try:
+        with open(os.path.join(ts_dir, "_result.json")) as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return None
+    details = data.get("details")
+    if not isinstance(details, dict):
+        return None
+    record_ids = set()
+    for key in details:
+        try:
+            record_ids.add(str(int(key)))
+        except (TypeError, ValueError):
+            record_ids.add(str(key))
+    return record_ids
+
+
+def video_inventory(ts_dir):
+    """Return ({episode id: camera names}, video file count).
+
+    RoboDojo normally writes multiple camera files for each episode, such as
+    `episode_0000000_cam_head_fail.mp4`.
+    """
+    cameras_by_episode = {}
+    file_count = 0
+    for dirpath, _dirnames, filenames in os.walk(ts_dir):
+        for filename in filenames:
+            if os.path.splitext(filename)[1].lower() not in VIDEO_EXTENSIONS:
+                continue
+            file_count += 1
+            episode_match = VIDEO_EPISODE_RE.match(filename)
+            if not episode_match:
+                continue
+            episode_id = str(int(episode_match.group(1)))
+            cameras = cameras_by_episode.setdefault(episode_id, set())
+            camera_match = VIDEO_CAMERA_RE.match(filename)
+            if camera_match:
+                cameras.add(camera_match.group(2))
+    return cameras_by_episode, file_count
+
+
+def collect_result_video_checks(random_of):
+    """Check only timestamp folders whose results are included in the summary."""
+    random_tasks = set(random_of.values())
+    summary_tasks = list(ALL_TASKS) + sorted(random_tasks)
+    selected = {}
+    for task in summary_tasks:
+        required_episodes = (
+            PAIRED_HALF_EPISODES
+            if is_paired_task(task, random_of) or task in random_tasks
+            else STANDALONE_EPISODES
+        )
+        task_path = os.path.join(ROOT, task)
+        for policy in list_subdirs(task_path):
+            policy_path = os.path.join(task_path, policy)
+            for embodiment in list_subdirs(policy_path):
+                emb_path = os.path.join(policy_path, embodiment)
+                for run in list_subdirs(emb_path):
+                    seed_match = SEED_RE.match(run)
+                    if not seed_match:
+                        continue
+                    ts_dir = latest_timestamp_dir(os.path.join(emb_path, run))
+                    if ts_dir is None:
+                        continue
+                    entries = load_entries(ts_dir)
+                    if entries is None:
+                        continue
+                    seed = int(seed_match.group(1))
+                    key = (task, policy, embodiment, seed)
+                    timestamp = os.path.basename(ts_dir)
+                    previous = selected.get(key)
+                    if previous is None or timestamp > previous["timestamp"]:
+                        selected[key] = {
+                            "task": task,
+                            "policy": policy,
+                            "embodiment": embodiment,
+                            "run": run,
+                            "timestamp": timestamp,
+                            "ts_dir": ts_dir,
+                            "required_episodes": required_episodes,
+                            "entry_count": len(entries),
+                        }
+
+    checks = []
+    for selected_result in selected.values():
+        if selected_result.pop("entry_count") < selected_result.pop(
+            "required_episodes"
+        ):
+            continue
+        ts_dir = selected_result.pop("ts_dir")
+        record_ids = result_record_ids(ts_dir)
+        cameras_by_episode, file_count = video_inventory(ts_dir)
+        video_episode_ids = set(cameras_by_episode)
+        if record_ids is None:
+            missing_by_episode = {}
+            extra_episode_count = len(video_episode_ids)
+            matches = False
+        else:
+            missing_by_episode = {
+                episode_id: EXPECTED_CAMERAS - cameras_by_episode.get(
+                    episode_id, set()
+                )
+                for episode_id in record_ids
+                if EXPECTED_CAMERAS - cameras_by_episode.get(
+                    episode_id, set()
+                )
+            }
+            extra_episode_count = len(video_episode_ids - record_ids)
+            matches = not missing_by_episode and not extra_episode_count
+        checks.append({
+            **selected_result,
+            "result_count": None if record_ids is None else len(record_ids),
+            "video_count": len(video_episode_ids),
+            "video_file_count": file_count,
+            "missing_camera_count": sum(
+                len(cameras) for cameras in missing_by_episode.values()
+            ),
+            "extra_episode_count": extra_episode_count,
+            "matches": matches,
+        })
+    return sorted(
+        checks,
+        key=lambda check: (
+            check["task"], check["policy"], check["embodiment"], check["run"]
+        ),
+    )
 
 
 def load_entries(ts_dir):
@@ -248,14 +391,24 @@ def main():
                 policy, _embodiment, seed = key
                 record(policy, task, seed, sr, score)
 
+    media_checks = collect_result_video_checks(random_of)
     write_markdown(data, gen_split)
     n_cells = sum(len(seeds) for tasks in data.values() for seeds in tasks.values())
     complete = sum(1 for p in data if policy_is_complete(p, data))
     tested = sum(1 for p in data if policy_progress(p, data)[0] > 0)
+    media_mismatches = sum(
+        1 for check in media_checks
+        if not check["matches"]
+    )
     print(
         f"Wrote {len(data)} policy tables ({n_cells} filled cells, "
         f"{tested} in overview, {complete} complete) to {OUTPUT_MD}"
     )
+    print(
+        f"Result/video check: {len(media_checks)} latest timestamp folders, "
+        f"{media_mismatches} mismatches"
+    )
+    print_result_video_check(media_checks)
 
 
 def mean_with_spread(values, integer=False):
@@ -525,6 +678,92 @@ def build_generalization_split(gen_split):
     for _, _, cells in rows:
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
+
+    lines += build_generalization_per_task_tables(gen_split)
+    return lines
+
+
+def _gen_split_seed_means(policy_task_data, seed, tasks):
+    """Average SR/Score for one seed over a subset of split-task names."""
+    srs = []
+    scores = []
+    for task in tasks:
+        task_data = policy_task_data.get(task, {})
+        if seed in task_data:
+            sr, score = task_data[seed]
+            srs.append(sr)
+            scores.append(score)
+    if not srs:
+        return None
+    return sum(srs) / len(srs), sum(scores) / len(scores)
+
+
+def _format_gen_split_avg_row(policy_task_data, tasks, label):
+    """Avg row for the extra Generalization split tables only."""
+    cells = [label]
+    seed_srs = []
+    seed_scores = []
+    for seed in EXPECTED_SEEDS:
+        means = _gen_split_seed_means(policy_task_data, seed, tasks)
+        if means is None:
+            cells.extend(["", ""])
+        else:
+            sr, score = means
+            cells.append(f"{sr:.1f}")
+            cells.append(f"{score:.2f}")
+            seed_srs.append(sr)
+            seed_scores.append(score)
+    if seed_srs:
+        cells.append(mean_with_spread(seed_srs, integer=True))
+        cells.append(mean_with_spread(seed_scores))
+    else:
+        cells.extend(["", ""])
+    return cells
+
+
+def build_generalization_per_task_tables(gen_split):
+    """Extra per-policy tables: 12 Generalization tasks, standard and `_random`.
+
+    Does not change merged 50-episode scores used by overview / policy tables.
+    """
+    lines = [
+        "### Per-task Standard vs Random",
+        "",
+        "Additional view only: each of the 12 Generalization tasks is listed "
+        "as the 25-episode standard split and its `_random` sibling. Columns "
+        "match the per-policy all-task tables. Existing merged 50-episode "
+        "scores are unchanged.",
+        "",
+    ]
+
+    header = ["Task"]
+    for seed in EXPECTED_SEEDS:
+        header.append(f"Seed {seed} SR (%)")
+        header.append(f"Seed {seed} Score")
+    header.append("Avg SR (%)")
+    header.append("Avg Score")
+
+    standard_tasks = list(DIMENSIONS["Generalization"])
+    random_tasks = [f"{task}_random" for task in standard_tasks]
+
+    for policy in sorted(gen_split):
+        policy_task_data = gen_split_as_task_data(gen_split[policy])
+        if not policy_task_data:
+            continue
+        lines.append(f"#### {policy}")
+        lines.append("")
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("| --- | " + " | ".join(["---:"] * (len(header) - 1)) + " |")
+        for task in gen_split_task_names():
+            cells = format_task_row(task, policy_task_data.get(task, {}))
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("| " + " | ".join(_format_gen_split_avg_row(
+            policy_task_data, standard_tasks, "**Avg Standard**"
+        )) + " |")
+        lines.append("| " + " | ".join(_format_gen_split_avg_row(
+            policy_task_data, random_tasks, "**Avg Random**"
+        )) + " |")
+        lines.append("")
     return lines
 
 
@@ -644,6 +883,58 @@ def format_seed_avg_row(policy_data):
     else:
         cells.extend(["", ""])
     return cells
+
+
+def gen_split_as_task_data(policy_gen_data):
+    """Flatten gen_split[policy] into {task_name: {seed: (sr, score)}}.
+
+    The standard half keeps the base task name; the random half is
+    `{task}_random`.
+    """
+    out = {}
+    for task, seed_map in policy_gen_data.items():
+        for seed, halves in seed_map.items():
+            if "base" in halves:
+                out.setdefault(task, {})[seed] = halves["base"]
+            if "random" in halves:
+                out.setdefault(f"{task}_random", {})[seed] = halves["random"]
+    return out
+
+
+def gen_split_task_names():
+    """Return the 24 display names: each Generalization task then its `_random`."""
+    names = []
+    for task in DIMENSIONS["Generalization"]:
+        names.append(task)
+        names.append(f"{task}_random")
+    return names
+
+
+def print_result_video_check(checks):
+    """Print folders with missing three-camera episode videos."""
+    mismatches = [
+        check for check in checks
+        if not check["matches"]
+    ]
+    if not mismatches:
+        print("All records have head, left_wrist, and right_wrist videos.")
+        return
+
+    mismatch_label = "\033[1;31m[MISMATCH]\033[0m"
+    for check in mismatches:
+        path = "/".join([
+            check["task"], check["policy"], check["embodiment"],
+            check["run"], check["timestamp"],
+        ])
+        message = (
+            f"{mismatch_label} {path}: "
+            f"missing_camera_files={check['missing_camera_count']}"
+        )
+        if check["extra_episode_count"]:
+            message += (
+                f", extra_video_episodes={check['extra_episode_count']}"
+            )
+        print(message)
 
 
 def write_markdown(data, gen_split):
