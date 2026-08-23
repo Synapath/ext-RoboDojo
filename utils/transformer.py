@@ -8,6 +8,9 @@ import transforms3d as t3d
 
 
 def quat_to_mat(q):
+    if hasattr(q, "detach"):
+        q = q.detach().cpu().numpy()
+    q = np.asarray(q).reshape(-1)
     w, x, y, z = q
     return np.array(
         [

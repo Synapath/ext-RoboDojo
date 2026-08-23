@@ -431,7 +431,11 @@ class LayoutManager:
             if not relative:
                 env_pos = deepcopy(self.scene_manager.env_origins[env_idx]).to(device)
                 pos = pos + env_pos
-            return (pos, rot)
+            if isinstance(pos, torch.Tensor):
+                pos = pos.detach().cpu().numpy()
+            if isinstance(rot, torch.Tensor):
+                rot = rot.detach().cpu().numpy()
+            return (np.asarray(pos).reshape(-1), np.asarray(rot).reshape(-1))
         elif instance_type in ["garment", "geometry"]:
             state = obj.get_state(is_relative=True)
             root_pose = state["root_pose"].detach().cpu().numpy()

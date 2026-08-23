@@ -42,7 +42,11 @@ class Func_Parser:
                 for obj in self.layout_manager.get_layout_records(env_idx, type):
                     inst_name = obj["inst_name"]
                     pos, rot = self.layout_manager.get_instance_pose(inst_name=inst_name, env_idx=env_idx)
-                    pose = np.concatenate([pos, rot])
+                    if isinstance(pos, torch.Tensor):
+                        pos = pos.detach().cpu().numpy()
+                    if isinstance(rot, torch.Tensor):
+                        rot = rot.detach().cpu().numpy()
+                    pose = np.concatenate([np.asarray(pos).reshape(-1), np.asarray(rot).reshape(-1)])
                     self.pre_state[env_idx][inst_name] = {
                         "pose": pose,
                     }

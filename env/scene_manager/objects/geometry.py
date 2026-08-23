@@ -272,11 +272,7 @@ class GeometryObject(SingleGeometryPrim):
             orientation = orientation.squeeze()
         root_pose = torch.cat([translation, orientation])
         if is_relative and hasattr(self, "env_origin"):
-            env_origin_tensor = (
-                torch.tensor(self.env_origin, dtype=torch.float32, device=root_pose.device)
-                if isinstance(self.env_origin, np.ndarray)
-                else self.env_origin
-            )
+            env_origin_tensor = torch.as_tensor(self.env_origin, dtype=root_pose.dtype, device=root_pose.device)
             if env_origin_tensor.dim() == 0:
                 env_origin_tensor = env_origin_tensor.unsqueeze(0)
             if env_origin_tensor.shape[0] < 3:

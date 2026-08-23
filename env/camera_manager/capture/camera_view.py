@@ -14,6 +14,8 @@ import omni.replicator.core as rep
 import torch
 import warp as wp
 
+from env.camera_manager.capture.warmup import EmptyAnnotatorDataError
+
 ANNOTATOR_SPEC = {
     "rgb": {"name": "rgba", "channels": 4, "dtype": wp.uint8},
     "rgba": {"name": "rgba", "channels": 4, "dtype": wp.uint8},
@@ -308,6 +310,10 @@ class CameraView(XFormPrim):
         else:
             tiled_data: wp.array = data
             info = {}
+        if getattr(tiled_data, "size", 0) == 0:
+            raise EmptyAnnotatorDataError(
+                f"annotator {annotator_type!r} returned an empty buffer on {getattr(tiled_data, 'device', 'unknown')}"
+            )
         # tiled image
         if tiled:
             shape = (*self.tiled_resolution, spec["channels"])

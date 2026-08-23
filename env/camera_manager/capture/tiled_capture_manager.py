@@ -12,6 +12,7 @@ import torch
 
 from env.camera_manager.camera_manager import CameraManager
 from env.camera_manager.capture.camera_view import CameraView
+from env.camera_manager.capture.warmup import get_data_with_warmup_retry
 from env.environment.isaac.isaac_rl_env import IsaacRLEnv
 
 
@@ -155,7 +156,9 @@ class TiledCaptureManager:
                 if cam_id in self._output_buffers and annotator_name in self._output_buffers[cam_id]:
                     pre_allocated_out = self._output_buffers[cam_id][annotator_name]
 
-                out, info = self.tiled_cameras[cam_id].get_data(annotator_name, out=pre_allocated_out)
+                out, info = get_data_with_warmup_retry(
+                    self.tiled_cameras[cam_id], annotator_name, pre_allocated_out, self.sim.render
+                )
 
                 # Convert out to numpy if it's a warp array (only convert once, reuse buffer)
                 if hasattr(out, "numpy"):
