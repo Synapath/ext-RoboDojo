@@ -12,6 +12,7 @@ import torch
 
 from env.camera_manager.camera_manager import CameraManager
 from env.camera_manager.capture.camera_view import CameraView
+from env.camera_manager.capture.device import explicit_cuda_device
 from env.camera_manager.capture.warmup import get_data_with_warmup_retry
 from env.environment.isaac.isaac_rl_env import IsaacRLEnv
 
@@ -32,7 +33,7 @@ class TiledCaptureManager:
         self.config = config
         self.camera_manager = camera_manager
         self.num_envs = num_envs
-        self.device = device
+        self.device = explicit_cuda_device(device)
         self.tiled_render_products: List[str] = []  # all the render products
         self.annotator: List[
             List[List[Annotator]]
@@ -108,6 +109,7 @@ class TiledCaptureManager:
                 prim_paths_by_cam_id,
                 camera_resolution=[width, height],
                 output_annotators=self.annotator_type[cam_id],
+                device=self.device,
             )
             self.tiled_cameras.append(tiled_camera)
             self.tiled_render_products.append(tiled_camera._render_product)
@@ -128,7 +130,7 @@ class TiledCaptureManager:
                 # Pre-allocate warp array on CUDA to reuse memory
                 import warp as wp
 
-                self._output_buffers[cam_id][annotator_name] = wp.zeros(shape, dtype=spec["dtype"], device="cuda:0")
+                self._output_buffers[cam_id][annotator_name] = wp.zeros(shape, dtype=spec["dtype"], device=self.device)
 
     def step(self, env_ids: List[int] = None, cam_ids: List[int] = None) -> List[List[List[any]]]:
         """

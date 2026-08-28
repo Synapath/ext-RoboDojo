@@ -14,6 +14,7 @@ import omni.replicator.core as rep
 import torch
 import warp as wp
 
+from env.camera_manager.capture.device import explicit_cuda_device
 from env.camera_manager.capture.warmup import EmptyAnnotatorDataError
 
 ANNOTATOR_SPEC = {
@@ -182,6 +183,7 @@ class CameraView(XFormPrim):
         scales: np.ndarray | torch.Tensor | wp.array | None = None,
         visibilities: np.ndarray | torch.Tensor | wp.array | None = None,
         reset_xform_properties: bool = True,
+        device: str | None = None,
     ):
         XFormPrim.__init__(
             self,
@@ -197,6 +199,7 @@ class CameraView(XFormPrim):
         self._output_annotators = output_annotators
         self._annotators = dict()
         self.camera_resolution = camera_resolution
+        self.device = explicit_cuda_device(device)
         self._tiled_render_product = None
         self._setup_tiled_sensor()
 
@@ -248,15 +251,15 @@ class CameraView(XFormPrim):
             # get annotator
             if annotator_type == "rgba" or annotator_type == "rgb":
                 self._annotators["rgba"] = rep.AnnotatorRegistry.get_annotator(
-                    "rgb", device="cuda", do_array_copy=False
+                    "rgb", device=self.device, do_array_copy=False
                 )
             elif annotator_type == "depth" or annotator_type == "distance_to_image_plane":
                 self._annotators["distance_to_image_plane"] = rep.AnnotatorRegistry.get_annotator(
-                    "distance_to_image_plane", device="cuda", do_array_copy=False
+                    "distance_to_image_plane", device=self.device, do_array_copy=False
                 )
             else:
                 self._annotators[annotator_type] = rep.AnnotatorRegistry.get_annotator(
-                    annotator_type, device="cuda", do_array_copy=False
+                    annotator_type, device=self.device, do_array_copy=False
                 )
         # attach the annotator to the render product
         for annotator in self._annotators.values():
