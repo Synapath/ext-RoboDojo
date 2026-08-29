@@ -805,11 +805,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     episode_score = process_scores[env_idx] / 100.0
                     self.total_score += episode_score
 
-                # seed_list was filtered by completed/abandoned ids on resume,
-                # so seed_list.index(seed) no longer yields the original
-                # layout id. Since init_eval populates seed_list as
-                # range(N_layouts), seed == layout_id by construction; use
-                # env_seeds[env_idx] directly.
+                # seed_list may be an explicit subset and is also filtered on
+                # resume. env_seeds stores the original layout id directly.
                 self.eval_result["details"][index] = {
                     "layout_id": int(self.env_seeds[env_idx]),
                     "success": bool(self.success[env_idx]),

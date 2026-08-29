@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List
 
 from env.global_configs import ASSETS_PATH, BENCHMARK
+from env.seed_manager.layout_selection import select_layout_ids
 from utils.load_file import *
 
 
@@ -37,12 +38,16 @@ class SeedManager:
             key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
         )
 
-        matching_files = [str(p) for p in matching_files]
         self.seed_info = {}
-        for idx, file_path in enumerate(matching_files):
-            self.seed_info[idx] = {"scene_layout": file_path}
+        for path in matching_files:
+            layout_id = int(path.stem.rsplit("_", 1)[-1])
+            self.seed_info[layout_id] = {"scene_layout": str(path)}
 
-        all_layout_ids = list(range(len(matching_files)))
+        all_layout_ids = select_layout_ids(
+            os.environ.get("ROBODOJO_LAYOUT_IDS"), sorted(self.seed_info)
+        )
+        if os.environ.get("ROBODOJO_LAYOUT_IDS"):
+            print(f"[SeedManager] exact layout selection: {all_layout_ids}")
         excluded = set(int(s) for s in (completed_layout_ids or [])) | set(int(s) for s in (abandoned_layout_ids or []))
         if excluded:
             self.seed_list: List[int] = [s for s in all_layout_ids if s not in excluded]
