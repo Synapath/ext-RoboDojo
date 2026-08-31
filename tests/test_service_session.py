@@ -98,10 +98,11 @@ class ResidentContracts(unittest.TestCase):
             env.capture_manager.tiled_cameras.clear()
         env.close = close
         modules = {"omni": SimpleNamespace(usd=usd), "omni.usd": usd,
+            "omni.syntheticdata": SimpleNamespace(SyntheticData=SimpleNamespace(Get=lambda: SimpleNamespace(reset=lambda: events.append("graph-reset")))),
             "isaaclab.sim": SimpleNamespace(SimulationContext=SimpleNamespace(instance=lambda: singleton[0]))}
         with patch.dict(sys.modules, modules):
             result = retire_environment(env, SimpleNamespace(is_running=lambda: True))
-        self.assertEqual(events, ["unsubscribe", "close"])
+        self.assertEqual(events, ["unsubscribe", "graph-reset", "close"])
         self.assertEqual(result["render_products_released"], 3)
         self.assertEqual(result["new_stage_id"], 2)
 

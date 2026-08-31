@@ -25,6 +25,7 @@ def environment_mode(spec, previous_spec):
 def retire_environment(env, app):
     """Release the pinned IsaacLab context without closing SimulationApp."""
     import omni.usd
+    from omni.syntheticdata import SyntheticData
     from isaaclab.sim import SimulationContext
 
     context = omni.usd.get_context()
@@ -36,6 +37,11 @@ def retire_environment(env, app):
         handle.unsubscribe()
         simulation._app_control_on_stop_handle = None
     products = len(env.capture_manager.tiled_render_products)
+    # Tiled render products share SyntheticData dependencies. In 0.6.13,
+    # per-annotator recursive detach can visit stale NodeObj entries. Retiring
+    # the entire owned stage permits its public graph reset, which checks node
+    # validity and clears activation history before individual camera release.
+    SyntheticData.Get().reset()
     env.close()
     if env.sim is not None or SimulationContext.instance() is not None:
         raise RuntimeError("Old physics context survived environment close")
@@ -45,7 +51,8 @@ def retire_environment(env, app):
     if env.capture_manager.tiled_render_products or env.capture_manager.tiled_cameras:
         raise RuntimeError("Old camera resources survived environment close")
     return {"old_stage_id": old_stage, "new_stage_id": context.get_stage_id(),
-            "render_products_released": products, "physics_singleton_cleared": True}
+            "render_products_released": products, "physics_singleton_cleared": True,
+            "syntheticdata_graphs_reset": True}
 
 
 def reset_renderer_history(context):
