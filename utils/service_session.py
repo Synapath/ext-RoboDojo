@@ -75,10 +75,17 @@ def retire_environment(env, app):
     import omni.usd
     from omni.syntheticdata import SyntheticData
     from isaaclab.sim import SimulationContext
+    from pxr import UsdUtils
 
     context = omni.usd.get_context()
     old_stage = context.get_stage_id()
     simulation = SimulationContext.instance()
+    # IsaacLab inserts its initial stage in the global USD cache; closing the
+    # context alone need not erase that strong reference. Keep exact owned
+    # stages until close, then evict only these, never clear the whole cache.
+    owned_stages = [context.get_stage(), getattr(env, "stage", None)]
+    if simulation is not None:
+        owned_stages.append(simulation.get_initial_stage())
     unsubscribe_context(simulation)
     products = len(env.capture_manager.tiled_render_products)
     # Tiled render products share SyntheticData dependencies. In 0.6.13,
@@ -114,11 +121,23 @@ def retire_environment(env, app):
     if (context.get_stage() is None or context.get_stage_id() == old_stage
             or not app.is_running()):
         raise RuntimeError("Environment close did not replace stage and retain application")
+    stage_cache = UsdUtils.StageCache.Get()
+    evicted = 0
+    for stage in owned_stages:
+        if stage is None:
+            continue
+        if stage == context.get_stage():
+            raise RuntimeError("Retired stage is still current")
+        if stage_cache.Contains(stage):
+            stage_cache.Erase(stage)
+            evicted += 1
+        if stage_cache.Contains(stage):
+            raise RuntimeError("Retired stage survived USD cache eviction")
     if env.capture_manager.tiled_render_products or env.capture_manager.tiled_cameras:
         raise RuntimeError("Old camera resources survived environment close")
     return {"old_stage_id": old_stage, "new_stage_id": context.get_stage_id(),
             "render_products_released": products, "physics_singleton_cleared": True,
-            "syntheticdata_graphs_reset": True}
+            "syntheticdata_graphs_reset": True, "stage_cache_evictions": evicted}
 
 
 class SessionShutdown(BaseException):

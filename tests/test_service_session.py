@@ -90,12 +90,14 @@ class ResidentContracts(unittest.TestCase):
 
     def test_retire_unsubscribes_before_close_and_checks_new_stage(self):
         events = []
-        context = SimpleNamespace(get_stage_id=lambda: stage[0], get_stage=lambda: object())
+        context = SimpleNamespace(get_stage_id=lambda: stage[0], get_stage=lambda: stage[0])
         usd = SimpleNamespace(get_context=lambda: context)
         singleton, stage = [None], [1]
         simulation = SimpleNamespace(_app_control_on_stop_handle=SimpleNamespace(unsubscribe=lambda: events.append("unsubscribe")))
         singleton[0] = simulation
         simulation._on_post_physics_ready_callback = SimpleNamespace(reset=lambda: events.append("post-ready-reset"))
+        simulation.get_initial_stage = lambda: 1
+        cache = {1, 2, 99}  # current replacement and unrelated stages must survive
         planner = SimpleNamespace(close=lambda: events.append("planner-close"))
         env = SimpleNamespace(sim=SimpleNamespace(sim=simulation), capture_manager=SimpleNamespace(tiled_render_products=[1, 2, 3], tiled_cameras=[1]),
             robot_manager=SimpleNamespace(planner={"x5":planner}, ik_solver={"x5":planner}, robot_list=[1]))
@@ -110,12 +112,16 @@ class ResidentContracts(unittest.TestCase):
         env.close = close
         modules = {"omni": SimpleNamespace(usd=usd), "omni.usd": usd,
             "omni.syntheticdata": SimpleNamespace(SyntheticData=SimpleNamespace(Get=lambda: SimpleNamespace(reset=lambda: events.append("graph-reset")))),
-            "isaaclab.sim": SimpleNamespace(SimulationContext=SimpleNamespace(instance=lambda: singleton[0]))}
+            "isaaclab.sim": SimpleNamespace(SimulationContext=SimpleNamespace(instance=lambda: singleton[0])),
+            "pxr": SimpleNamespace(UsdUtils=SimpleNamespace(StageCache=SimpleNamespace(Get=lambda:
+                SimpleNamespace(Contains=lambda stage: stage in cache, Erase=cache.remove))))}
         with patch.dict(sys.modules, modules):
             result = retire_environment(env, SimpleNamespace(is_running=lambda: True))
         self.assertEqual(events, ["unsubscribe", "post-ready-reset", "graph-reset", "close", "planner-close"])
         self.assertEqual(result["render_products_released"], 3)
         self.assertEqual(result["new_stage_id"], 2)
+        self.assertEqual(result["stage_cache_evictions"], 1)
+        self.assertEqual(cache, {2, 99})
 
     def test_planner_explicit_close_is_idempotent_and_releases_all_fields(self):
         close = load_method("env/planner_manager/curobo_planner.py", "CuroboPlanner", "close", {})
