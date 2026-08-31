@@ -11,6 +11,8 @@ import time
 import traceback
 import weakref
 
+from utils.policy_execution import validate_horizon
+
 SCHEMA = "sim-service-resident-v2"
 HEX = re.compile(r"^[0-9a-f]{32}$")
 SPEC_FIELDS = {"task", "policy_adapter", "policy_host", "policy_port", "checkpoint_ref",
@@ -223,6 +225,7 @@ def validate_request(value, session_id, sequence, previous_spec=None):
     spec = value["spec"]
     if not isinstance(spec, dict) or set(spec) != SPEC_FIELDS or spec["headless"] is not True:
         raise ValueError("Invalid resident spec")
+    validate_horizon(spec["policy_adapter"], spec["execution_horizon"])
     if previous_spec is not None and spec["headless"] != previous_spec["headless"]:
         raise ValueError("Incompatible resident application")
     return spec

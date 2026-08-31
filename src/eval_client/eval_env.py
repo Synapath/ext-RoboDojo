@@ -19,6 +19,7 @@ from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
 from utils.performance import profiled
 from utils.episode_telemetry import EpisodeTelemetry
+from utils.policy_execution import execution_client
 
 
 def _patch_websockets_proxy_compat():
@@ -364,7 +365,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 )
                 raise AttributeError("Missing eval_one_episode in policy module")
 
-            eval_module.eval_one_episode(TASK_ENV=self, model_client=self.model_client)
+            eval_module.eval_one_episode(
+                TASK_ENV=self, model_client=execution_client(policy_name, self.model_client)
+            )
 
         def eval_one_episode_batch(self):
             policy_name = self.deploy_cfg["policy_name"]
@@ -389,7 +392,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 )
                 raise AttributeError("Missing eval_one_episode_batch in policy module")
 
-            eval_module.eval_one_episode_batch(TASK_ENV=self, model_client=self.model_client)
+            eval_module.eval_one_episode_batch(
+                TASK_ENV=self, model_client=execution_client(policy_name, self.model_client)
+            )
 
         def get_action_type(self, action):
             action_type = []
