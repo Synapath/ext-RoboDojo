@@ -15,6 +15,15 @@ SPEC_FIELDS = {"task", "policy_adapter", "policy_host", "policy_port", "checkpoi
 DYNAMIC_FIELDS = {"policy_host", "policy_port", "checkpoint_ref", "seed"}
 
 
+def reset_renderer_history(context):
+    """Clear prior-frame accumulation without changing rendering settings.
+
+    UsdContext.reset_renderer_accumulation is available in pinned omni.usd
+    1.13.10. It must run after layout changes and before the native warmup.
+    """
+    context.reset_renderer_accumulation()
+
+
 def validate_request(value, session_id, sequence, previous_spec=None):
     if not isinstance(value, dict) or set(value) != {
         "schema_version", "session_id", "sequence", "job_id", "request_hash", "nonce", "spec"

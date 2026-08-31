@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import sys
 from unittest.mock import patch
 
 from utils.service_session import validate_request
@@ -119,6 +120,26 @@ class ResidentContracts(unittest.TestCase):
         capture.cameras[0][0].prim_path = "/changed"
         with self.assertRaises(RuntimeError):
             reset(capture)
+
+    def test_renderer_history_cleared_after_layout_before_native_warmup(self):
+        events = []
+        context = SimpleNamespace(reset_renderer_accumulation=lambda: events.append("history-reset"))
+        usd = SimpleNamespace(get_context=lambda: context)
+        omni = SimpleNamespace(usd=usd)
+        setup = load_method("src/eval_client/eval_env.py", "EvalEnv", "setup_scene", {"os": os})
+        env = SimpleNamespace(num_envs=1, unstable_nums=0, episode_nums=1, physx_monitor_enabled=False,
+            scene_manager=SimpleNamespace(apply_saved_poses=lambda **kw: events.append("layout"),
+                layout_manager=SimpleNamespace(check_layout_stability=lambda env: (True, []))),
+            _align_layout_success=lambda: None, render=lambda: events.append("render"),
+            sim_step=lambda: events.append("physics"), obs_manager=SimpleNamespace(get_obs=lambda: events.append("obs")))
+        with patch.dict(os.environ, {"SIM_SERVICE_SESSION_ID": "a" * 32}), patch.dict(sys.modules, {"omni": omni, "omni.usd": usd}):
+            setup(env)
+        self.assertEqual(events[:3], ["layout", "history-reset", "render"])
+        self.assertEqual(events.count("history-reset"), 1)
+        self.assertEqual(events.count("render"), 50)
+        self.assertEqual(events.count("physics"), 200)
+        self.assertEqual(events.count("obs"), 40)
+        self.assertTrue(env._renderer_history_reset)
 
 
 if __name__ == "__main__":

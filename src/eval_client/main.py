@@ -383,6 +383,7 @@ def main(env=None, resident=False):
                     "layout_files": [env.seed_manager.seed_info[s]["scene_layout"] for s in env.env_seeds],
                     "action_queues_empty": all(q.is_empty() for q in env.robot_manager.control_manager.control_queue),
                     "render_products": len(env.capture_manager.tiled_render_products),
+                    "renderer_history_reset": env._renderer_history_reset,
                     "details_before_episode": len(env.eval_result["details"]),
                     "video_writers_before_episode": len(env.video_writers),
                     "take_action_count": list(env.take_action_cnt),
