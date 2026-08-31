@@ -5,6 +5,8 @@ import json
 import os
 import sys
 
+from utils.performance import PROFILE
+
 from isaaclab.app import AppLauncher
 
 MAX_INPROC_RESTARTS = 3
@@ -336,6 +338,10 @@ def main():
     )
 
     env_cfg.sim.seed = [0 for _ in range(num_envs)]
+    PROFILE.metadata.update({
+        "num_envs": num_envs, "eval_num": eval_num, "task": task_name,
+        "sim_config": OmegaConf.to_container(env_cfg.sim, resolve=True),
+    })
     run_id = os.environ["ROBODOJO_RUN_ID"]
     resume_state = _load_resume_manifest(eval_cfg, run_id)
     env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
@@ -351,8 +357,11 @@ def main():
             get_monitor().reset()
         bad_envs = None
         try:
+            PROFILE.set_phase("reset")
             env.reset(seed=env.env_seeds)
+            PROFILE.set_phase("episode")
             env.run_eval()
+            PROFILE.set_phase("finalize")
             env.seed_manager.eval_step()
 
         except PhysXFatalError as e:
@@ -441,7 +450,10 @@ def main():
     _delete_resume_manifest(env)
     _close_model_client(env)
     env.close()
+    PROFILE.set_phase("shutdown")
     simulation_app.close()
+    PROFILE.finished = True
+    PROFILE.write()
 
 
 if __name__ == "__main__":

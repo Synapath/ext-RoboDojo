@@ -13,6 +13,8 @@ import torch
 from env.camera_manager.camera_manager import CameraManager
 from env.camera_manager.capture.camera_view import CameraView
 from env.environment.isaac.isaac_rl_env import IsaacRLEnv
+from utils.camera_readback import selected_frames_to_numpy
+from utils.performance import profiled
 
 
 class TiledCaptureManager:
@@ -129,6 +131,7 @@ class TiledCaptureManager:
 
                 self._output_buffers[cam_id][annotator_name] = wp.zeros(shape, dtype=spec["dtype"], device="cuda:0")
 
+    @profiled("camera_readback")
     def step(self, env_ids: List[int] = None, cam_ids: List[int] = None) -> List[List[List[any]]]:
         """
         Step the annotator. When env_id and cam_id is given, use the given. Otherwise apply to all cameras.
@@ -157,17 +160,16 @@ class TiledCaptureManager:
 
                 out, info = self.tiled_cameras[cam_id].get_data(annotator_name, out=pre_allocated_out)
 
-                # Convert out to numpy if it's a warp array (only convert once, reuse buffer)
-                if hasattr(out, "numpy"):
-                    out_np = out.numpy()
-                elif hasattr(out, "cpu"):
-                    out_np = out.cpu().numpy()
-                else:
-                    out_np = out
+                # Warp->torch is a shared GPU view. Select before the CPU copy,
+                # rather than transferring inactive environments every frame.
+                import warp as wp
+                if isinstance(out, wp.array):
+                    out = wp.to_torch(out)
+                out_np = selected_frames_to_numpy(out, env_ids)
 
                 env_list = []
-                for env_id in env_ids:
-                    env_list.append({"data": out_np[env_id], "info": info})
+                for selected_idx, env_id in enumerate(env_ids):
+                    env_list.append({"data": out_np[selected_idx], "info": info})
 
                 cam_data[annotator_name] = env_list
             data.append(cam_data)

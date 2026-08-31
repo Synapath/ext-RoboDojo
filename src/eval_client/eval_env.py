@@ -17,6 +17,7 @@ from env.seed_manager.seed_manager import SeedManager
 from utils.cluttered_generator import UnStableError
 from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
+from utils.performance import profiled
 
 
 def _patch_websockets_proxy_compat():
@@ -195,6 +196,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 ws_ping_timeout_s=self.deploy_cfg.get("ws_ping_timeout_s", 20.0),
             )
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
+            # Include transport, serialization and waiting, not just inference.
+            self.model_client.call = profiled("policy_rpc")(self.model_client.call)
 
         def close(self):
             self._abort_video_writers()
@@ -266,6 +269,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def get_obs(self):
             return self.get_obs_batch(env_idx_list=[0])[0]
 
+        @profiled("observation")
         def get_obs_batch(self, env_idx_list=None, last_frame=False):
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
@@ -355,6 +359,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.validate_action_dict(action)
             self.take_action_batch([action], env_idx_list=[0])
 
+        @profiled("action")
         def take_action_batch(self, actions_list, env_idx_list=None):
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
@@ -869,6 +874,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def get_running_env_idx_list(self):
             return [idx for idx in range(self.num_envs) if not self.end_flag[idx]]
 
+        @profiled("video_append")
         def _stream_vision(self, env_idx, frame):
             """Append this env's per-camera RGB frames to its ffmpeg streams.
 
@@ -918,6 +924,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     except Exception:
                         pass
 
+        @profiled("video_finalize")
         def save_video(self, env_idx, video_path, tag):
             writers = self.video_writers.pop(env_idx, {})
             for cam_key, writer in writers.items():
