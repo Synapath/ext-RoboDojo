@@ -183,6 +183,14 @@ class TiledCaptureManager:
         Only Hard Reset need which means if we reset simulation backend we need to initialize camera again
         Since Render product change, we also need to attch a new writer maybe
         """
+        if self.tiled_cameras:
+            paths = [[camera.prim_path for camera in cameras] for cameras in self.cameras]
+            if paths != self.camera_prim_paths or len(self.tiled_cameras) != self.num_cams:
+                raise RuntimeError("Camera topology changed during soft reset")
+            # Existing render products observe the same prims after pose reset.
+            # Reattaching on every soft reset leaks products/annotators and
+            # leaves step() reading the old entries at the start of the list.
+            return
         self.init_cameras()
 
     def destroy(self):
@@ -200,4 +208,6 @@ class TiledCaptureManager:
         self.sim = None
         for rp in self.tiled_render_products:
             rp.destroy()
+        self.tiled_render_products.clear()
+        self._output_buffers.clear()
         self.camera_prim_paths.clear()
