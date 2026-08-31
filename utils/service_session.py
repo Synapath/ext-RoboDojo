@@ -62,7 +62,11 @@ def collect_environment(refs):
     clear_import_cache()
     gc.collect()
     torch.cuda.synchronize()
-    alive = [name for name, ref in refs if ref() is not None]
+    # USD weak-pointer bindings can keep a Python wrapper alive after the C++
+    # stage is destroyed (repr: "invalid null stage"). Its bool is the native
+    # validity check. Ordinary owners still require the Python weakref to die.
+    alive = [name for name, ref in refs
+             if ref() is not None and (name != "stage" or bool(ref()))]
     if alive:
         raise RuntimeError("Retired environment objects survived: " + ", ".join(alive))
     torch.cuda.empty_cache()

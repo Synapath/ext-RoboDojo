@@ -14,7 +14,7 @@ import weakref
 from unittest.mock import patch
 
 from utils.service_session import (validate_request, environment_mode, retire_environment,
-    EnvironmentOwner, SessionShutdown, collect_environment, completed_progress, _serve_jobs)
+    EnvironmentOwner, SessionShutdown, collect_environment, completed_progress, _serve_jobs, serve)
 from utils.performance import WallProfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -181,6 +181,24 @@ class ResidentContracts(unittest.TestCase):
             collect_environment([("environment", ref)])
         self.assertIsNone(ref())
 
+    def test_expired_usd_stage_wrapper_is_not_a_live_native_stage(self):
+        class Stage:
+            valid = True
+            def __bool__(self):
+                return self.valid
+        stage = Stage()
+        ref = weakref.ref(stage)
+        torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda:None, empty_cache=lambda:None,
+            memory_allocated=lambda:0, memory_reserved=lambda:0))
+        with patch.dict(sys.modules, {"torch":torch}), patch("utils.service_session.clear_import_cache"):
+            with self.assertRaisesRegex(RuntimeError, "stage"):
+                collect_environment([("stage", ref)])
+            stage.valid = False
+            collect_environment([("stage", ref)])
+            # Never apply USD's special validity rule to ordinary falsey owners.
+            with self.assertRaisesRegex(RuntimeError, "environment"):
+                collect_environment([("environment", ref)])
+
     def test_shutdown_signal_unwinds_but_does_not_reenter_cleanup(self):
         owner = EnvironmentOwner(SimpleNamespace(close=lambda:self.fail("handler must not close app")))
         with self.assertRaises(SessionShutdown):
@@ -255,6 +273,62 @@ class ResidentContracts(unittest.TestCase):
             close(env)
         self.assertEqual(events, ["video-close","obs","env"])
         self.assertEqual(env.video_writers, {})
+
+    def test_failed_job_cleans_up_and_never_acknowledges_success(self):
+        for failure in ("job", "cleanup"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "eval_result").mkdir()
+                mailbox = root / "mailbox"
+                mailbox.mkdir()
+                (mailbox / "request.json").write_text(json.dumps(self.request()))
+                owner = EnvironmentOwner(object())
+                replies, releases = [], []
+                def run_job(**kwargs):
+                    env = SimpleNamespace(sim=object(), num_envs=1, success_nums=0, fail_nums=1)
+                    owner.adopt(env)
+                    if failure == "job":
+                        raise RuntimeError("injected job error")
+                    return env
+                def detach():
+                    owner.env = None
+                    return ["refs"]
+                def collect(refs):
+                    releases.append(refs)
+                    if failure == "cleanup":
+                        raise RuntimeError("injected cleanup error")
+                previous = os.getcwd()
+                try:
+                    os.chdir(root)
+                    with patch.dict(os.environ, {"SIM_SERVICE_SESSION_ID":"a"*32}), \
+                            patch.object(owner,"detach",detach), patch.object(owner,"collect",collect), \
+                            patch("utils.service_session.atomic_json",lambda path,value:replies.append(value)):
+                        _serve_jobs(SimpleNamespace(service_session=str(mailbox)), run_job, object(), WallProfile(), owner)
+                finally:
+                    os.chdir(previous)
+                self.assertEqual(len(replies), 1)
+                self.assertEqual(replies[0]["code"], 1)
+                self.assertIn(f"injected {failure} error", replies[0]["error"])
+                self.assertEqual(releases, [["refs"]])
+
+    def test_outer_shutdown_also_closes_app_after_partial_construction_failure(self):
+        events = []
+        # Simulates context registration before create_eval_env can return and
+        # transfer ownership. The process must retire instead of serving again.
+        simulation = SimpleNamespace(_app_control_on_stop_handle=SimpleNamespace(unsubscribe=lambda:events.append("unsubscribe")),
+            _on_post_physics_ready_callback=SimpleNamespace(reset=lambda:events.append("ready-reset")))
+        modules = {"isaaclab.sim":SimpleNamespace(SimulationContext=SimpleNamespace(instance=lambda:simulation))}
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(sys.modules, modules), \
+                patch("utils.service_session._serve_jobs", side_effect=RuntimeError("construction")), \
+                patch("utils.service_session.collect_environment", return_value={}), \
+                patch("utils.service_session.signal.signal", return_value=None):
+            app = SimpleNamespace(close=lambda:events.append("application-close"))
+            with self.assertRaisesRegex(RuntimeError, "construction"):
+                serve(SimpleNamespace(service_session=temporary), None, app, WallProfile())
+            receipt = json.loads((Path(temporary)/"shutdown.json").read_text())
+        self.assertFalse(receipt["environment_owned"])
+        self.assertIsNone(receipt["cleanup_error"])
+        self.assertEqual(events, ["unsubscribe", "ready-reset", "application-close"])
 
     def test_configure_evaluation_resets_all_job_state_without_replacing_sim(self):
         namespace = {"deepcopy": deepcopy, "os": os, "datetime": datetime, "BENCHMARK": "RoboDojo",
