@@ -224,6 +224,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.obs_manager.initialize(self)
 
         def reset(self, seed=None, options=None):
+            # Subsequent batches also reload layouts without _post_setup_scene.
+            # Rebind descriptions after each soft reset, not only a new job.
+            self._bind_observations_after_reset = self.sim is not None
             seed = list(seed)
             if len(seed) < self.num_envs:
                 seed = seed + [None] * (self.num_envs - len(seed))
@@ -274,6 +277,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.episode_nums -= len(unstable_envs)
             if not success or self.episode_nums <= 0:
                 raise UnStableError("All scene Unstable Error!")
+            if os.environ.get("SIM_SERVICE_SESSION_ID"):
+                import omni.usd
+                from utils.service_session import reset_renderer_history
+
+                reset_renderer_history(omni.usd.get_context())
+                self._renderer_history_reset = True
             for _ in range(10):
                 self.render()
             for idx in range(200):
