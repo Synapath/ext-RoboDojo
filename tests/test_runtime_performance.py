@@ -1,11 +1,34 @@
 import unittest
+from unittest.mock import patch
+import json
+import os
+from pathlib import Path
+import tempfile
 
 from utils.camera_readback import selected_frames_to_numpy
-from utils.performance import WallProfile
+from utils.performance import WallProfile, close_profiled_app
 from utils.eval_allocation import effective_num_envs
 
 
 class RuntimePerformanceTests(unittest.TestCase):
+    def test_profile_persisted_before_nonreturning_kit_shutdown(self):
+        profile = WallProfile(True)
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path.cwd()
+            try:
+                os.chdir(directory)
+                class App:
+                    def close(self):
+                        payload = json.loads(next(Path("eval_result").glob("performance-*.json")).read_text())
+                        assert payload["finished"] is True
+                        assert payload["metadata"]["shutdown_complete"] is False
+                        raise SystemExit(0)
+                with patch("utils.performance.PROFILE", profile), patch.dict(os.environ, {"ROBODOJO_RUN_ID": "test-shutdown"}):
+                    with self.assertRaises(SystemExit):
+                        close_profiled_app(App())
+            finally:
+                os.chdir(original)
+
     def test_allocation_is_capped_by_effective_episode_count(self):
         self.assertEqual(effective_num_envs(10, 1), 1)
         self.assertEqual(effective_num_envs(10, 7), 7)

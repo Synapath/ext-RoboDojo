@@ -84,6 +84,17 @@ PROFILE = WallProfile(enabled=os.environ.get("ROBODOJO_PROFILE") == "1")
 atexit.register(PROFILE.write)
 
 
+def close_profiled_app(app):
+    """Kit shutdown may terminate Python without returning or running atexit."""
+    PROFILE.set_phase("shutdown")
+    PROFILE.finished = True  # evaluation finished, not necessarily app shutdown
+    PROFILE.metadata["shutdown_complete"] = False
+    PROFILE.write()
+    app.close()
+    PROFILE.metadata["shutdown_complete"] = True
+    PROFILE.write()
+
+
 def profiled(name):
     def decorate(function):
         @wraps(function)
