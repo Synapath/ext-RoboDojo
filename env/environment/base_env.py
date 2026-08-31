@@ -112,6 +112,7 @@ class BaseEnv(gym.Env):
         self.stage = get_current_stage()
         self.interactiveSceneCfg = kwargs.get("interactiveSceneCfg", None)
 
+    @profiled("environment_build")
     def launch_sim(self, config):
         """
         This function will launch the isaaclab simulation with the given configuration.

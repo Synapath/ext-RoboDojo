@@ -1,5 +1,6 @@
 """Serial, worker-private job mailbox. No socket, command execution or retries."""
 from contextlib import contextmanager
+import gc
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,38 @@ HEX = re.compile(r"^[0-9a-f]{32}$")
 SPEC_FIELDS = {"task", "policy_adapter", "policy_host", "policy_port", "checkpoint_ref",
                "env_config", "action_type", "seed", "eval_num", "execution_horizon", "headless"}
 DYNAMIC_FIELDS = {"policy_host", "policy_port", "checkpoint_ref", "seed"}
+
+
+def environment_mode(spec, previous_spec):
+    if previous_spec is None:
+        return "cold"
+    return "rebuild" if any(spec[k] != previous_spec[k] for k in SPEC_FIELDS - DYNAMIC_FIELDS) else "reset"
+
+
+def retire_environment(env, app):
+    """Release the pinned IsaacLab context without closing SimulationApp."""
+    import omni.usd
+    from isaaclab.sim import SimulationContext
+
+    context = omni.usd.get_context()
+    old_stage = context.get_stage_id()
+    simulation = env.sim.sim
+    # This fork's STOP handler renders until PLAY, so unsubscribe BEFORE stop.
+    handle = simulation._app_control_on_stop_handle
+    if handle is not None:
+        handle.unsubscribe()
+        simulation._app_control_on_stop_handle = None
+    products = len(env.capture_manager.tiled_render_products)
+    env.close()
+    if env.sim is not None or SimulationContext.instance() is not None:
+        raise RuntimeError("Old physics context survived environment close")
+    if (context.get_stage() is None or context.get_stage_id() == old_stage
+            or not app.is_running()):
+        raise RuntimeError("Environment close did not replace stage and retain application")
+    if env.capture_manager.tiled_render_products or env.capture_manager.tiled_cameras:
+        raise RuntimeError("Old camera resources survived environment close")
+    return {"old_stage_id": old_stage, "new_stage_id": context.get_stage_id(),
+            "render_products_released": products, "physics_singleton_cleared": True}
 
 
 def reset_renderer_history(context):
@@ -41,8 +74,8 @@ def validate_request(value, session_id, sequence, previous_spec=None):
     spec = value["spec"]
     if not isinstance(spec, dict) or set(spec) != SPEC_FIELDS or spec["headless"] is not True:
         raise ValueError("Invalid resident spec")
-    if previous_spec is not None and any(spec[k] != previous_spec[k] for k in SPEC_FIELDS - DYNAMIC_FIELDS):
-        raise ValueError("Incompatible resident environment")
+    if previous_spec is not None and spec["headless"] != previous_spec["headless"]:
+        raise ValueError("Incompatible resident application")
     return spec
 
 
@@ -60,16 +93,21 @@ def job_log(path):
     """Capture Python and native writes; restore fds before completion ACK."""
     sys.stdout.flush()
     sys.stderr.flush()
-    saved = [os.dup(1), os.dup(2)]
+    # Preserve the native PhysX monitor's pipes. Redirect their echo fds, not
+    # stdout/stderr themselves (which would bypass monitoring during a job).
+    monitor_module = sys.modules.get("src.eval_client.physx_warning_monitor")
+    monitor = monitor_module.get_monitor() if monitor_module is not None else None
+    targets = [monitor._saved_fd_by_target[k] for k in (1, 2)] if monitor is not None and monitor._started else [1, 2]
+    saved = [os.dup(fd) for fd in targets]
     with path.open("xb", buffering=0) as stream:
         try:
-            os.dup2(stream.fileno(), 1)
-            os.dup2(stream.fileno(), 2)
+            for target in targets:
+                os.dup2(stream.fileno(), target)
             yield
         finally:
             sys.stdout.flush()
             sys.stderr.flush()
-            for target, original in zip((1, 2), saved):
+            for target, original in zip(targets, saved):
                 os.dup2(original, target)
                 os.close(original)
 
@@ -79,7 +117,7 @@ def serve(args, run_job, app, profile):
     session_id = os.environ["SIM_SERVICE_SESSION_ID"]
     if not HEX.fullmatch(session_id):
         raise ValueError("Invalid session ID")
-    sequence, env, previous_spec = 1, None, None
+    sequence, env, previous_spec, generation = 1, None, None, 0
     # App startup has already occurred: preserve its first-job profiling cost.
     launch_profile = profile.snapshot()
     profile.enabled = False  # idle time is never charged to a job
@@ -103,21 +141,35 @@ def serve(args, run_job, app, profile):
         os.environ["ROBODOJO_RUN_ID"] = "service-" + job_id
         os.environ["ROBODOJO_OUTPUT_ROOT"] = str(output)
         os.environ["EVAL_NUM"] = str(spec["eval_num"])
+        if spec["policy_adapter"] == "Pi_05" and spec["execution_horizon"] is not None:
+            os.environ["PI05_EXECUTION_HORIZON"] = str(spec["execution_horizon"])
+        else:
+            os.environ.pop("PI05_EXECUTION_HORIZON", None)
         args.task_name, args.env_cfg_type = spec["task"], spec["env_config"]
         args.policy_name, args.host, args.port = spec["policy_adapter"], spec["policy_host"], spec["policy_port"]
         args.policy_server_url = f"ws://{args.host}:{args.port}"
         args.seed = spec["seed"]
         args.additional_info = f"ckpt_name={spec['checkpoint_ref']},action_type={spec['action_type']}"
         profile.__init__(enabled=os.environ.get("ROBODOJO_PROFILE") == "1")
+        mode = environment_mode(spec, previous_spec)
+        generation += mode != "reset"
         profile.metadata.update({"session_id": session_id, "sequence": sequence, "job_id": job_id,
-                                 "warm": env is not None, "pid": os.getpid()})
+                                 "warm": sequence > 1, "pid": os.getpid(), "application_id": id(app),
+                                 "mode": mode, "environment_generation": generation})
         if sequence == 1:
             profile.metadata["app_launch_s"] = launch_profile["elapsed_s"]
         receipt = {k: v for k, v in request.items() if k != "spec"}
-        receipt.update({"pid": os.getpid(), "warm": env is not None, "code": 1, "error": None})
+        receipt.update({"pid": os.getpid(), "application_id": id(app), "warm": sequence > 1,
+                        "mode": mode, "environment_generation": generation, "code": 1, "error": None})
         failed = False
         with job_log(directory / "runner.log"):
             try:
+                if mode == "rebuild":
+                    profile.set_phase("environment_teardown")
+                    profile.metadata["teardown"] = retire_environment(env, app)
+                    env = None
+                    gc.collect()
+                profile.set_phase("configuration")
                 env = run_job(env=env, resident=True)
                 receipt.update({"code": 0, "environment_id": id(env), "simulator_id": id(env.sim),
                                 "num_envs": env.num_envs, "seed": spec["seed"],
