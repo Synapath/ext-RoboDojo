@@ -6,6 +6,7 @@ import os
 import sys
 
 from utils.performance import PROFILE
+from utils.eval_allocation import effective_num_envs
 
 from isaaclab.app import AppLauncher
 
@@ -329,6 +330,16 @@ def main():
         if str(_env_eval_num).lower() != "native":
             eval_num = min(int(_env_eval_num), int(eval_num))
     eval_cfg["eval_num"] = eval_num
+
+    # Resolve task/native and EVAL_NUM limits before constructing any vector
+    # scene, robot, camera or per-environment seed arrays.
+    allocated_num_envs = effective_num_envs(num_envs, eval_num)
+    if allocated_num_envs != num_envs:
+        print(f"[main] Effective eval_num={eval_num}: num_envs capped {num_envs} -> {allocated_num_envs}")
+    num_envs = allocated_num_envs
+    eval_cfg["num_envs"] = num_envs
+    OmegaConf.update(env_cfg, "sim.scene.num_envs", num_envs, force_add=True)
+    OmegaConf.update(env_cfg, "eval_cfg.num_envs", num_envs, force_add=True)
 
     OmegaConf.update(
         env_cfg,
