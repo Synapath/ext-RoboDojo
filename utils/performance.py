@@ -72,7 +72,7 @@ class WallProfile:
         run_id = os.environ.get("ROBODOJO_RUN_ID", "")
         if not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in run_id):
             return
-        root = Path("eval_result")
+        root = Path(os.environ.get("ROBODOJO_OUTPUT_ROOT", "eval_result"))
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"performance-{run_id}-{os.getpid()}.json"
         temporary = path.with_suffix(".json.tmp")

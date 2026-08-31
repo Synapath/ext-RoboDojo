@@ -14,7 +14,8 @@ MAX_INPROC_RESTARTS = 3
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--task_name", type=str)
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
+parser.add_argument("--num_envs", type=int, default=None, help="Number of environments; default from sim YAML.")
+parser.add_argument("--service_session", type=str, default="")
 parser.add_argument(
     "--env_cfg_type",
     type=str,
@@ -249,7 +250,7 @@ def _exit_for_shell_restart(env, fatal_msg):
     os._exit(99)
 
 
-def main():
+def main(env=None, resident=False):
     """Assemble the env config, build the eval env, and run the eval loop with
     PhysX crash/resume recovery until the requested episode count is reached.
     """
@@ -257,6 +258,8 @@ def main():
     num_envs = args_cli.num_envs
     eval_cfg_name = args_cli.env_cfg_type
     eval_cfg = load_yaml(os.path.join(ENV_CONFIG_PATH, eval_cfg_name + ".yml"))
+    if num_envs is None:
+        num_envs = int(load_yaml(os.path.join(ENV_CONFIG_PATH, "sim", eval_cfg["config"]["sim"] + ".yml"))["scene"]["num_envs"])
     eval_cfg["task_name"] = task_name
     eval_cfg["num_envs"] = num_envs
     eval_cfg["device_id"] = args_cli.device_id
@@ -330,6 +333,7 @@ def main():
         if str(_env_eval_num).lower() != "native":
             eval_num = min(int(_env_eval_num), int(eval_num))
     eval_cfg["eval_num"] = eval_num
+    OmegaConf.update(env_cfg, "eval_cfg.eval_num", eval_num, force_add=True)
 
     # Resolve task/native and EVAL_NUM limits before constructing any vector
     # scene, robot, camera or per-environment seed arrays.
@@ -354,8 +358,11 @@ def main():
         "sim_config": OmegaConf.to_container(env_cfg.sim, resolve=True),
     })
     run_id = os.environ["ROBODOJO_RUN_ID"]
-    resume_state = _load_resume_manifest(eval_cfg, run_id)
-    env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+    resume_state = None if resident else _load_resume_manifest(eval_cfg, run_id)
+    if env is None:
+        env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+    else:
+        env.configure_evaluation(env_cfg)
     eval_time = env.success_nums + env.fail_nums
     if eval_time >= eval_num:
         # Already complete on resume - nothing left to do.
@@ -370,12 +377,24 @@ def main():
         try:
             PROFILE.set_phase("reset")
             env.reset(seed=env.env_seeds)
+            if resident:
+                PROFILE.metadata.setdefault("resets", []).append({
+                    "layout_ids": list(env.env_seeds),
+                    "layout_files": [env.seed_manager.seed_info[s]["scene_layout"] for s in env.env_seeds],
+                    "action_queues_empty": all(q.is_empty() for q in env.robot_manager.control_manager.control_queue),
+                    "render_products": len(env.capture_manager.tiled_render_products),
+                    "details_before_episode": len(env.eval_result["details"]),
+                    "video_writers_before_episode": len(env.video_writers),
+                    "take_action_count": list(env.take_action_cnt),
+                })
             PROFILE.set_phase("episode")
             env.run_eval()
             PROFILE.set_phase("finalize")
             env.seed_manager.eval_step()
 
         except PhysXFatalError as e:
+            if resident:
+                raise
             # Unrecoverable: GPU/CUDA context is dead. Persist progress
             # and re-exec (or sys.exit(99) for bash to restart).
             if not enable_monitor:
@@ -385,12 +404,18 @@ def main():
             _restart_or_exit(env, simulation_app, str(e))
 
         except PhysXBrokenError as e:
+            if resident:
+                raise
             # Monitor caught the warning in time.
             bad_envs = sorted(e.broken_envs)
 
         except UnStableError:
+            if resident:
+                raise
             env.seed_manager.eval_step()
         except Exception as e:
+            if resident:
+                raise
             import traceback
 
             print(
@@ -456,13 +481,24 @@ def main():
             print("No more seeds to run, exiting.")
             break
 
-        env.close()
+        if not resident:
+            env.close()
 
     _delete_resume_manifest(env)
     _close_model_client(env)
+    if resident:
+        env.model_client = None
+        if env.success_nums + env.fail_nums != eval_num:
+            raise RuntimeError("Resident evaluation did not complete its denominator")
+        return env
     env.close()
     close_profiled_app(simulation_app)
 
 
 if __name__ == "__main__":
-    main()
+    if args_cli.service_session:
+        from utils.service_session import serve
+
+        serve(args_cli, main, simulation_app, PROFILE)
+    else:
+        main()

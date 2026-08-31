@@ -53,6 +53,18 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
     class EvalEnv(task_class):
         def __init__(self, config, app, resume_state=None, **kwargs):
             super().__init__(config, app, **kwargs)
+            self.configure_evaluation(config, resume_state)
+
+        def configure_evaluation(self, config, resume_state=None):
+            """Fresh job state, without reconstructing the task/Isaac environment."""
+            if getattr(self, "video_writers", None):
+                raise RuntimeError("Cannot reset a job with unfinished video writers")
+            previous_client = getattr(self, "model_client", None)
+            if previous_client is not None:
+                previous_client.close()
+            if config.sim.scene.num_envs != self.num_envs:
+                raise ValueError("Resident environment count cannot change")
+            self.env_seed_list = list(config.sim.seed)
             self.eval_cfg = config.eval_cfg
             self.config_name = self.eval_cfg.get("config_name", None)
             self.task_name = self.eval_cfg.get("task_name", None)
@@ -79,7 +91,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 os.environ["ROBODOJO_RUN_ID"] = run_id
             self.run_id = run_id
             self.save_dir = os.path.join(
-                "eval_result",
+                os.environ.get("ROBODOJO_OUTPUT_ROOT", "eval_result"),
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
@@ -198,6 +210,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
             # Include transport, serialization and waiting, not just inference.
             self.model_client.call = profiled("policy_rpc")(self.model_client.call)
+            # A reused simulator skips _post_setup_scene. Bind descriptions
+            # only after reset has loaded THIS job's layout, not the last one.
+            self._bind_observations_after_reset = self.sim is not None
 
         def close(self):
             self._abort_video_writers()
@@ -239,6 +254,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     self.current_env_seed_map[idx] = seed[idx]
 
             super().reset(seed=self.env_seeds, options=options)
+            if self._bind_observations_after_reset:
+                self.obs_manager.initialize(self)
+                self._bind_observations_after_reset = False
             self.obs_manager.reset()  # Reset observation manager for the next episode
             self.setup_scene()
             self.robot_manager.set_origin_endpose()
@@ -664,7 +682,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             locate by humans.
             """
             return os.path.join(
-                "eval_result",
+                os.environ.get("ROBODOJO_OUTPUT_ROOT", "eval_result"),
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
