@@ -2,9 +2,22 @@ import unittest
 
 from utils.camera_readback import selected_frames_to_numpy
 from utils.performance import WallProfile
+from utils.eval_allocation import effective_num_envs
 
 
 class RuntimePerformanceTests(unittest.TestCase):
+    def test_allocation_is_capped_by_effective_episode_count(self):
+        self.assertEqual(effective_num_envs(10, 1), 1)
+        self.assertEqual(effective_num_envs(10, 7), 7)
+        self.assertEqual(effective_num_envs(10, 50), 10)
+        self.assertEqual(effective_num_envs(1, 50), 1)
+
+    def test_allocation_rejects_nonpositive_and_noninteger_values(self):
+        for configured, episodes in [(0, 1), (10, 0), (-1, 2), (10, -1), (True, 1), (10, 1.5)]:
+            with self.subTest(configured=configured, episodes=episodes):
+                with self.assertRaises(ValueError):
+                    effective_num_envs(configured, episodes)
+
     def test_nested_exclusive_time_is_not_double_counted(self):
         values = iter([0, 1, 2, 5, 7, 10, 12])
         profile = WallProfile(True, lambda: next(values))
