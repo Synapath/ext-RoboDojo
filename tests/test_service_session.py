@@ -9,7 +9,7 @@ import unittest
 import sys
 from unittest.mock import patch
 
-from utils.service_session import validate_request
+from utils.service_session import validate_request, environment_mode, retire_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,16 +58,52 @@ class ResidentContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_request(value, "a" * 32, 1)
 
-    def test_only_dynamic_fields_can_change_within_session(self):
+    def test_dynamic_fields_reset_and_structural_fields_rebuild(self):
         value = self.request()
         previous = deepcopy(value["spec"])
         value["spec"].update(seed=1, policy_host="10.0.0.3", policy_port=8000, checkpoint_ref="next")
         validate_request(value, "a" * 32, 1, previous)
+        self.assertEqual(environment_mode(value["spec"], previous), "reset")
+        self.assertEqual(environment_mode(value["spec"], None), "cold")
         for key, bad in (("task", "insert_gear"), ("eval_num", 2), ("execution_horizon", 50)):
             changed = deepcopy(value)
             changed["spec"][key] = bad
-            with self.assertRaises(ValueError):
-                validate_request(changed, "a" * 32, 1, previous)
+            validate_request(changed, "a" * 32, 1, previous)
+            self.assertEqual(environment_mode(changed["spec"], previous), "rebuild")
+
+    def test_camera_cleanup_detaches_actual_annotators_once(self):
+        cleanup = load_method("env/camera_manager/capture/camera_view.py", "CameraView", "_clean_up_tiled_sensor", {})
+        events = []
+        camera = SimpleNamespace(_render_product=SimpleNamespace(destroy=lambda: events.append("destroy")),
+            _render_product_path="/Render/test", _annotators={"rgb": SimpleNamespace(detach=lambda paths: events.append(paths))})
+        cleanup(camera)
+        cleanup(camera)
+        self.assertEqual(events, [["/Render/test"], "destroy"])
+        self.assertEqual(camera._annotators, {})
+
+    def test_retire_unsubscribes_before_close_and_checks_new_stage(self):
+        events = []
+        context = SimpleNamespace(get_stage_id=lambda: stage[0], get_stage=lambda: object())
+        usd = SimpleNamespace(get_context=lambda: context)
+        singleton, stage = [object()], [1]
+        simulation = SimpleNamespace(_app_control_on_stop_handle=SimpleNamespace(unsubscribe=lambda: events.append("unsubscribe")))
+        env = SimpleNamespace(sim=SimpleNamespace(sim=simulation), capture_manager=SimpleNamespace(tiled_render_products=[1, 2, 3], tiled_cameras=[1]))
+        def close():
+            self.assertIsNone(simulation._app_control_on_stop_handle)
+            events.append("close")
+            env.sim = None
+            singleton[0] = None
+            stage[0] = 2
+            env.capture_manager.tiled_render_products.clear()
+            env.capture_manager.tiled_cameras.clear()
+        env.close = close
+        modules = {"omni": SimpleNamespace(usd=usd), "omni.usd": usd,
+            "isaaclab.sim": SimpleNamespace(SimulationContext=SimpleNamespace(instance=lambda: singleton[0]))}
+        with patch.dict(sys.modules, modules):
+            result = retire_environment(env, SimpleNamespace(is_running=lambda: True))
+        self.assertEqual(events, ["unsubscribe", "close"])
+        self.assertEqual(result["render_products_released"], 3)
+        self.assertEqual(result["new_stage_id"], 2)
 
     def test_configure_evaluation_resets_all_job_state_without_replacing_sim(self):
         namespace = {"deepcopy": deepcopy, "os": os, "datetime": datetime, "BENCHMARK": "RoboDojo",

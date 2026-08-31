@@ -114,7 +114,7 @@ if not os.environ.get("ROBODOJO_RUN_ID"):
 
 enable_monitor = _physx_monitor_needed(args_cli.task_name)
 print(f"[main] PhysX monitor enabled={enable_monitor} (task={args_cli.task_name})")
-if enable_monitor:
+if enable_monitor or args_cli.service_session:
     # Start before AppLauncher so Kit inherits the redirected stdout/stderr fds.
     from src.eval_client.physx_warning_monitor import (
         PhysXBrokenError,
@@ -255,6 +255,7 @@ def main(env=None, resident=False):
     PhysX crash/resume recovery until the requested episode count is reached.
     """
     task_name = args_cli.task_name
+    enable_monitor = _physx_monitor_needed(task_name)
     num_envs = args_cli.num_envs
     eval_cfg_name = args_cli.env_cfg_type
     eval_cfg = load_yaml(os.path.join(ENV_CONFIG_PATH, eval_cfg_name + ".yml"))

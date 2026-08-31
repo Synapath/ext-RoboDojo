@@ -199,6 +199,8 @@ class TiledCaptureManager:
         This function will be called when we close the environment.
         """
 
+        for camera in self.tiled_cameras:
+            camera.close()
         self.annotator.clear()
         self.annotator_type.clear()
         self.annotator_device.clear()
@@ -206,8 +208,6 @@ class TiledCaptureManager:
         self.cameras.clear()
         self.camera_names.clear()
         self.sim = None
-        for rp in self.tiled_render_products:
-            rp.destroy()
         self.tiled_render_products.clear()
         self._output_buffers.clear()
         self.camera_prim_paths.clear()
