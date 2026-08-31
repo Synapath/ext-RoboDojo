@@ -15,6 +15,7 @@ from env.global_configs import ENV_REGEX_NAMESPACE
 from env.planner_manager.curobo_planner import CuroboPlanner
 from env.robot_manager.control_manager import ControlManager, MetaControl
 from utils.ensure_usd_path import ensure_usd_path
+from utils.performance import profiled
 
 
 class RobotManager:
@@ -322,6 +323,7 @@ class RobotManager:
             control_info_list.append(control_info)
         return control_info_list
 
+    @profiled("ik")
     def solve_ik(
         self,
         target_pose: List[float],
