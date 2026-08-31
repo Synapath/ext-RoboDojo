@@ -18,6 +18,7 @@ from utils.cluttered_generator import UnStableError
 from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
 from utils.performance import profiled
+from utils.episode_telemetry import EpisodeTelemetry
 
 
 def _patch_websockets_proxy_compat():
@@ -131,6 +132,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             # Replaces the old full-episode frame cache; only vision frames are
             # streamed to disk as they arrive instead of buffered in RAM.
             self.video_writers: dict[int, dict[str, VideoStreamWriter]] = {}
+            self.telemetry_enabled = bool(os.environ.get("SIM_SERVICE_SESSION_ID"))
+            self.telemetry = {}
+            self.telemetry_actions = {}
             self.episode_nums = self.num_envs
             self.unstable_nums = 0
             self.unstable_envs: set[int] = set()
@@ -215,6 +219,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self._bind_observations_after_reset = self.sim is not None
 
         def close(self):
+            getattr(self, "telemetry", {}).clear()
+            getattr(self, "telemetry_actions", {}).clear()
             if os.environ.get("SIM_SERVICE_SESSION_ID"):
                 # Interrupted service jobs retain partial videos as evidence.
                 for writers in self.video_writers.values():
@@ -316,7 +322,20 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data_list = []
             for env_idx in env_idx_list:
                 if not self.end_flag[env_idx] or last_frame:
-                    self._stream_vision(env_idx, data[env_idx])
+                    frames = self._stream_vision(env_idx, data[env_idx])
+                    if self.telemetry_enabled:
+                        if env_idx not in self.telemetry:
+                            names = {
+                                f"{robot.arm_name}_joint_state": list(robot.arm_joints_name)
+                                for robot in self.robot_manager.robot_list
+                                if robot.type == "target" and robot.robot_type == "arm"
+                            }
+                            self.telemetry[env_idx] = EpisodeTelemetry(self.sim.physics_dt, names)
+                        self.telemetry[env_idx].append(
+                            int(self.sim._sim_step_counter), data[env_idx].get("state", {}),
+                            self.robot_manager.control_manager.prev_control[env_idx],
+                            self.telemetry_actions.get(env_idx, {}), frames,
+                        )
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
                 data_list.append(env_data)
@@ -408,6 +427,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     continue
 
                 self.take_action_cnt[env_idx] += 1
+                if self.telemetry_enabled:
+                    self.telemetry_actions[env_idx] = deepcopy(action)
                 print(
                     f"env{env_idx} step: \033[92m{self.take_action_cnt[env_idx]} / {self.step_lim}\033[0m",
                     end="\r",
@@ -855,10 +876,20 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     "score": episode_score,
                 }
                 video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
-                self.save_video(env_idx, video_path, tag)
+                videos = self.save_video(env_idx, video_path, tag)
+                telemetry = self.telemetry.pop(env_idx, None)
+                if telemetry is not None:
+                    telemetry.save(
+                        os.path.join(self.save_dir, f"episode_{index:07d}.telemetry.json"),
+                        {"task": self.task_name, "env_config": self.config_name, "seed": int(self.eval_seed),
+                         "episode": int(index), "layout_id": int(self.env_seeds[env_idx])},
+                        videos,
+                    )
 
             # Drop streams for envs not saved this batch (e.g. unstable ones).
             self._abort_video_writers()
+            self.telemetry.clear()
+            self.telemetry_actions.clear()
 
             fail = self.episode_nums - success
             self.success_nums += success
@@ -912,13 +943,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def _stream_vision(self, env_idx, frame):
             """Append this env's per-camera RGB frames to its ffmpeg streams.
 
-            Only the vision ("color") data is recorded; writers are created
+            Vision ("color") writers are created
             lazily on the first frame (when the resolution is known) and write
             to temporary files until the episode outcome decides the name.
             """
             vision = frame.get("vision") if isinstance(frame, dict) else None
             if not vision:
-                return
+                return {}
+            frames = {}
             writers = self.video_writers.setdefault(env_idx, {})
             fps = self.obs_manager.collect_freq
             for cam_key, cam_data in vision.items():
@@ -933,6 +965,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     tmp_path = os.path.join(self._stream_dir, f"env{env_idx}_{cam_key}.tmp.mp4")
                     writers[cam_key] = VideoStreamWriter(tmp_path, height, width, channels, fps=fps)
                 writers[cam_key].append(color)
+                frames[cam_key] = writers[cam_key].n_frames - 1
+            return frames
 
         def _sweep_stream_dir(self):
             """Remove orphan temp videos left by a previous hard kill/crash."""
@@ -960,6 +994,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
         @profiled("video_finalize")
         def save_video(self, env_idx, video_path, tag):
+            videos = {}
             writers = self.video_writers.pop(env_idx, {})
             for cam_key, writer in writers.items():
                 tmp_path = writer.out_path
@@ -972,6 +1007,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     continue
                 os.makedirs(os.path.dirname(final_path), exist_ok=True)
                 os.replace(tmp_path, final_path)
+                videos[cam_key] = {"path": os.path.basename(final_path), "fps": writer.fps}
                 print(
                     format_video_saved_message(
                         final_path,
@@ -981,6 +1017,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         writer.fps,
                     )
                 )
+            return videos
 
         def have_empty(self, env_idx_list=None):
             if env_idx_list is None:
