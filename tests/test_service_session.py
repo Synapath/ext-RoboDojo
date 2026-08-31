@@ -7,9 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 import sys
+import gc
+import json
+import tempfile
+import weakref
 from unittest.mock import patch
 
-from utils.service_session import validate_request, environment_mode, retire_environment
+from utils.service_session import (validate_request, environment_mode, retire_environment,
+    EnvironmentOwner, SessionShutdown, collect_environment, completed_progress, _serve_jobs)
+from utils.performance import WallProfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,7 +44,7 @@ class DummyManager:
 
 class ResidentContracts(unittest.TestCase):
     def request(self):
-        return {"schema_version": "sim-service-resident-v1", "session_id": "a" * 32,
+        return {"schema_version": "sim-service-resident-v2", "session_id": "a" * 32,
                 "sequence": 1, "job_id": "b" * 32, "nonce": "c" * 32, "request_hash": "d" * 64,
                 "spec": {"task": "stack_bowls", "policy_adapter": "Pi_05", "policy_host": "10.0.0.2",
                          "policy_port": 9999, "checkpoint_ref": "hold", "env_config": "arx_x5",
@@ -58,12 +64,13 @@ class ResidentContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_request(value, "a" * 32, 1)
 
-    def test_dynamic_fields_reset_and_structural_fields_rebuild(self):
+    def test_all_subsequent_jobs_rebuild_even_identical_requests(self):
         value = self.request()
         previous = deepcopy(value["spec"])
         value["spec"].update(seed=1, policy_host="10.0.0.3", policy_port=8000, checkpoint_ref="next")
         validate_request(value, "a" * 32, 1, previous)
-        self.assertEqual(environment_mode(value["spec"], previous), "reset")
+        self.assertEqual(environment_mode(value["spec"], previous), "rebuild")
+        self.assertEqual(environment_mode(previous, previous), "rebuild")
         self.assertEqual(environment_mode(value["spec"], None), "cold")
         for key, bad in (("task", "insert_gear"), ("eval_num", 2), ("execution_horizon", 50)):
             changed = deepcopy(value)
@@ -85,9 +92,13 @@ class ResidentContracts(unittest.TestCase):
         events = []
         context = SimpleNamespace(get_stage_id=lambda: stage[0], get_stage=lambda: object())
         usd = SimpleNamespace(get_context=lambda: context)
-        singleton, stage = [object()], [1]
+        singleton, stage = [None], [1]
         simulation = SimpleNamespace(_app_control_on_stop_handle=SimpleNamespace(unsubscribe=lambda: events.append("unsubscribe")))
-        env = SimpleNamespace(sim=SimpleNamespace(sim=simulation), capture_manager=SimpleNamespace(tiled_render_products=[1, 2, 3], tiled_cameras=[1]))
+        singleton[0] = simulation
+        simulation._on_post_physics_ready_callback = SimpleNamespace(reset=lambda: events.append("post-ready-reset"))
+        planner = SimpleNamespace(close=lambda: events.append("planner-close"))
+        env = SimpleNamespace(sim=SimpleNamespace(sim=simulation), capture_manager=SimpleNamespace(tiled_render_products=[1, 2, 3], tiled_cameras=[1]),
+            robot_manager=SimpleNamespace(planner={"x5":planner}, ik_solver={"x5":planner}, robot_list=[1]))
         def close():
             self.assertIsNone(simulation._app_control_on_stop_handle)
             events.append("close")
@@ -102,9 +113,142 @@ class ResidentContracts(unittest.TestCase):
             "isaaclab.sim": SimpleNamespace(SimulationContext=SimpleNamespace(instance=lambda: singleton[0]))}
         with patch.dict(sys.modules, modules):
             result = retire_environment(env, SimpleNamespace(is_running=lambda: True))
-        self.assertEqual(events, ["unsubscribe", "graph-reset", "close"])
+        self.assertEqual(events, ["unsubscribe", "post-ready-reset", "graph-reset", "close", "planner-close"])
         self.assertEqual(result["render_products_released"], 3)
         self.assertEqual(result["new_stage_id"], 2)
+
+    def test_planner_explicit_close_is_idempotent_and_releases_all_fields(self):
+        close = load_method("env/planner_manager/curobo_planner.py", "CuroboPlanner", "close", {})
+        events = []
+        planner = DummyManager()
+        for name in ("ik_solver", "motion_planner", "motion_planner_batch"):
+            setattr(planner, name, SimpleNamespace(destroy=lambda name=name: events.append(name)))
+        planner.large_tensor = object()
+        close(planner)
+        close(planner)
+        self.assertEqual(len(events), 3)
+        self.assertEqual(planner.__dict__, {"_closed":True})
+
+    def test_planner_close_attempts_all_resources_and_reports_failure(self):
+        close = load_method("env/planner_manager/curobo_planner.py", "CuroboPlanner", "close", {})
+        events = []
+        def fail():
+            raise RuntimeError("graph teardown failed")
+        planner = SimpleNamespace(ik_solver=SimpleNamespace(destroy=fail),
+            motion_planner=SimpleNamespace(destroy=lambda:events.append("motion")),
+            motion_planner_batch=SimpleNamespace(destroy=lambda:events.append("batch")))
+        with self.assertRaisesRegex(RuntimeError, "graph teardown failed"):
+            close(planner)
+        self.assertEqual(events, ["motion", "batch"])
+
+    def test_gc_requires_dead_owners_not_just_free_allocator_cache(self):
+        marker = DummyManager()
+        ref = weakref.ref(marker)
+        calls = []
+        torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: None,
+            empty_cache=lambda: calls.append("empty"), memory_allocated=lambda:0, memory_reserved=lambda:0))
+        with patch.dict(sys.modules, {"torch":torch}), patch("utils.service_session.clear_import_cache") as clear:
+            with self.assertRaisesRegex(RuntimeError, "environment"):
+                collect_environment([("environment", ref)])
+            self.assertEqual(calls, [])
+            del marker
+            collect_environment([("environment", ref)])
+            self.assertEqual(calls, ["empty"])
+            self.assertEqual(clear.call_count, 2)
+
+    def test_import_exception_cache_is_cleared_before_owner_gc(self):
+        cached = []
+        def make():
+            env = DummyManager()
+            try:
+                raise FileNotFoundError("import probe")
+            except FileNotFoundError as exc:
+                cached.append(exc)
+            return weakref.ref(env)
+        ref = make()
+        gc.collect()
+        self.assertIsNotNone(ref())
+        torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda:None, empty_cache=lambda:None,
+            memory_allocated=lambda:0, memory_reserved=lambda:0))
+        modules = {"torch":torch, "omni.ext._impl": SimpleNamespace(stat_cache=SimpleNamespace(reset_stat_cache=cached.clear))}
+        with patch.dict(sys.modules, modules):
+            collect_environment([("environment", ref)])
+        self.assertIsNone(ref())
+
+    def test_shutdown_signal_unwinds_but_does_not_reenter_cleanup(self):
+        owner = EnvironmentOwner(SimpleNamespace(close=lambda:self.fail("handler must not close app")))
+        with self.assertRaises(SessionShutdown):
+            owner.signal(15, None)
+        owner.closing = True
+        owner.signal(15, None)
+        self.assertTrue(owner.stopping)
+
+    def test_progress_transfer_has_no_environment_or_mutable_alias(self):
+        env = SimpleNamespace(video_writers={}, save_dir="result", success_nums=1, fail_nums=2,
+            total_score=1.5, eval_result={"details":{0:{"layout_id":7}}}, abandoned_seeds=set())
+        progress = completed_progress(env)
+        env.eval_result["details"][0]["layout_id"] = 99
+        self.assertEqual(progress["details"]["0"]["layout_id"], 7)
+        self.assertEqual(progress["fail_nums"], 2)
+
+    def test_mailbox_ack_waits_for_cleanup_and_identical_jobs_rebuild(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root/"eval_result").mkdir()
+            mailbox = root/"mailbox"
+            mailbox.mkdir()
+            request = self.request()
+            (mailbox/"request.json").write_text(json.dumps(request))
+            owner = EnvironmentOwner(SimpleNamespace())
+            released, replies = [], []
+            def run_job(*, resident, owner):
+                self.assertIsNone(owner.env)
+                env = SimpleNamespace(sim=object(), num_envs=1, success_nums=0, fail_nums=1)
+                owner.adopt(env)
+                return env
+            def detach():
+                self.assertIsNotNone(owner.env)
+                owner.env = None
+                return ["retired"]
+            def collect(refs):
+                self.assertEqual(refs, ["retired"])
+                released.append(True)
+            def reply(path, value):
+                self.assertIsNone(owner.env)
+                self.assertEqual(len(released), len(replies)+1)
+                self.assertTrue(value["environment_released"])
+                self.assertEqual(value["environment_builds"], 1)
+                self.assertEqual(value["code"], 0)
+                replies.append(value)
+                if len(replies) == 2:
+                    raise SessionShutdown()
+                request.update(sequence=2, job_id="e"*32)
+                (mailbox/"request.json").write_text(json.dumps(request))
+            previous = os.getcwd()
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ, {"SIM_SERVICE_SESSION_ID":"a"*32}), \
+                        patch.object(owner,"detach",detach), patch.object(owner,"collect",collect), \
+                        patch("utils.service_session.atomic_json",reply):
+                    with self.assertRaises(SessionShutdown):
+                        _serve_jobs(SimpleNamespace(service_session=str(mailbox)), run_job, object(), WallProfile(), owner)
+            finally:
+                os.chdir(previous)
+            self.assertEqual([r["mode"] for r in replies], ["cold","rebuild"])
+            self.assertEqual([r["environment_generation"] for r in replies], [1,2])
+
+    def test_service_close_retains_partial_video_instead_of_abort(self):
+        events = []
+        close = load_method("src/eval_client/eval_env.py", "EvalEnv", "close",
+            {"os":os, "super":lambda:SimpleNamespace(close=lambda:events.append("env"))})
+        writer = SimpleNamespace(close=lambda **kwargs:events.append("video-close"))
+        env = SimpleNamespace(video_writers={0:{"head":writer}},
+            obs_manager=SimpleNamespace(reset=lambda:events.append("obs")),
+            _abort_video_writers=lambda:self.fail("partial evidence cannot be deleted"))
+        with patch.dict(os.environ, {"SIM_SERVICE_SESSION_ID":"a"*32}):
+            close(env)
+        self.assertEqual(events, ["video-close","obs","env"])
+        self.assertEqual(env.video_writers, {})
 
     def test_configure_evaluation_resets_all_job_state_without_replacing_sim(self):
         namespace = {"deepcopy": deepcopy, "os": os, "datetime": datetime, "BENCHMARK": "RoboDojo",

@@ -250,10 +250,16 @@ def _exit_for_shell_restart(env, fatal_msg):
     os._exit(99)
 
 
-def main(env=None, resident=False):
+def main(env=None, resident=False, owner=None):
     """Assemble the env config, build the eval env, and run the eval loop with
     PhysX crash/resume recovery until the requested episode count is reached.
     """
+    if resident:
+        from utils.service_session import EnvironmentOwner, completed_progress
+        if env is not None:
+            raise ValueError("Resident jobs cannot reuse an environment")
+        if owner is None:
+            owner = EnvironmentOwner(simulation_app)
     task_name = args_cli.task_name
     enable_monitor = _physx_monitor_needed(task_name)
     num_envs = args_cli.num_envs
@@ -362,6 +368,8 @@ def main(env=None, resident=False):
     resume_state = None if resident else _load_resume_manifest(eval_cfg, run_id)
     if env is None:
         env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+        if resident:
+            owner.adopt(env)
     else:
         env.configure_evaluation(env_cfg)
     eval_time = env.success_nums + env.fail_nums
@@ -478,6 +486,15 @@ def main(env=None, resident=False):
         if eval_time >= eval_num:
             break
 
+        if resident:
+            progress = completed_progress(env)
+            PROFILE.set_phase("environment_teardown")
+            refs = owner.detach()
+            env = None
+            owner.collect(refs)
+            PROFILE.set_phase("configuration")
+            env = create_eval_env(env_cfg, simulation_app, resume_state=progress)
+            owner.adopt(env)
         env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
         if env.env_seeds is None:
             print("No more seeds to run, exiting.")

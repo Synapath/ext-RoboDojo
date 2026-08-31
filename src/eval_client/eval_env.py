@@ -215,7 +215,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self._bind_observations_after_reset = self.sim is not None
 
         def close(self):
-            self._abort_video_writers()
+            if os.environ.get("SIM_SERVICE_SESSION_ID"):
+                # Interrupted service jobs retain partial videos as evidence.
+                for writers in self.video_writers.values():
+                    for writer in writers.values():
+                        writer.close(announce=False)
+                self.video_writers.clear()
+            else:
+                self._abort_video_writers()
             self.obs_manager.reset()
             super().close()
 
