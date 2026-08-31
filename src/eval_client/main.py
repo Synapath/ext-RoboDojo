@@ -5,7 +5,7 @@ import json
 import os
 import sys
 
-from utils.performance import PROFILE
+from utils.performance import PROFILE, close_profiled_app
 from utils.eval_allocation import effective_num_envs
 
 from isaaclab.app import AppLauncher
@@ -461,10 +461,7 @@ def main():
     _delete_resume_manifest(env)
     _close_model_client(env)
     env.close()
-    PROFILE.set_phase("shutdown")
-    simulation_app.close()
-    PROFILE.finished = True
-    PROFILE.write()
+    close_profiled_app(simulation_app)
 
 
 if __name__ == "__main__":
