@@ -66,6 +66,13 @@ class SeedManagerLayoutContracts(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     manager.init_eval()
 
+    def test_resident_entrypoint_syncs_layouts_into_runtime_config(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "eval_client" / "main.py"
+        ).read_text()
+        self.assertIn('"eval_cfg.layout_ids",', source)
+        self.assertIn("explicit_layout_ids,", source)
+
 
 if __name__ == "__main__":
     unittest.main()

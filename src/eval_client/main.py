@@ -358,6 +358,12 @@ def main(env=None, resident=False, owner=None):
         if eval_num != len(explicit_layout_ids):
             raise ValueError("Resident shard layouts exceed the task native eval limit")
         eval_cfg["layout_ids"] = explicit_layout_ids
+        OmegaConf.update(
+            env_cfg,
+            "eval_cfg.layout_ids",
+            explicit_layout_ids,
+            force_add=True,
+        )
     eval_cfg["eval_num"] = eval_num
     OmegaConf.update(env_cfg, "eval_cfg.eval_num", eval_num, force_add=True)
 
