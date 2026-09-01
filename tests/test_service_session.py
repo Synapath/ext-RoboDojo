@@ -45,7 +45,9 @@ class DummyManager:
 class ResidentContracts(unittest.TestCase):
     def request(self):
         return {"schema_version": "sim-service-resident-v2", "session_id": "a" * 32,
-                "sequence": 1, "job_id": "b" * 32, "nonce": "c" * 32, "request_hash": "d" * 64,
+                "sequence": 1, "job_id": "b" * 32, "shard_id": "shard-000",
+                "execution_id": "b" * 32 + "-shard-000", "layout_ids": [7],
+                "nonce": "c" * 32, "request_hash": "d" * 64,
                 "spec": {"task": "stack_bowls", "policy_adapter": "Pi_05", "policy_host": "10.0.0.2",
                          "policy_port": 9999, "checkpoint_ref": "hold", "env_config": "arx_x5",
                          "action_type": "ee", "seed": 0, "eval_num": 1,
@@ -55,7 +57,8 @@ class ResidentContracts(unittest.TestCase):
         value = self.request()
         self.assertEqual(validate_request(value, "a" * 32, 1), value["spec"])
         for key, bad in (("sequence", 0), ("session_id", "b" * 32), ("job_id", "../escape"),
-                         ("nonce", "bad"), ("request_hash", "bad")):
+                         ("shard_id", "bad"), ("execution_id", "bad"),
+                         ("layout_ids", [7, 7]), ("nonce", "bad"), ("request_hash", "bad")):
             changed = deepcopy(value)
             changed[key] = bad
             with self.assertRaises(ValueError):
@@ -75,6 +78,8 @@ class ResidentContracts(unittest.TestCase):
         for key, bad in (("task", "insert_gear"), ("eval_num", 2), ("execution_horizon", 50)):
             changed = deepcopy(value)
             changed["spec"][key] = bad
+            if key == "eval_num":
+                changed["layout_ids"] = [7, 9]
             validate_request(changed, "a" * 32, 1, previous)
             self.assertEqual(environment_mode(changed["spec"], previous), "rebuild")
 
@@ -246,7 +251,8 @@ class ResidentContracts(unittest.TestCase):
                 replies.append(value)
                 if len(replies) == 2:
                     raise SessionShutdown()
-                request.update(sequence=2, job_id="e"*32)
+                request.update(sequence=2, job_id="e"*32,
+                               execution_id="e"*32 + "-shard-000")
                 (mailbox/"request.json").write_text(json.dumps(request))
             previous = os.getcwd()
             try:

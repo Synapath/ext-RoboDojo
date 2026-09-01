@@ -335,10 +335,29 @@ def main(env=None, resident=False, owner=None):
     env_cfg = process_randomization(env_cfg)
     env_cfg, eval_num = process_config(env_cfg, task_name=task_name)
 
+    explicit_layout_ids = None
+    if resident:
+        try:
+            explicit_layout_ids = json.loads(os.environ["ROBODOJO_LAYOUT_IDS"])
+        except (KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("Resident shard layout IDs are missing or invalid") from exc
+        if (
+            not isinstance(explicit_layout_ids, list)
+            or not explicit_layout_ids
+            or any(type(value) is not int or value < 0 for value in explicit_layout_ids)
+            or explicit_layout_ids != sorted(explicit_layout_ids)
+            or len(set(explicit_layout_ids)) != len(explicit_layout_ids)
+        ):
+            raise ValueError("Resident shard layout IDs must be sorted and unique")
+
     if os.environ.get("EVAL_NUM"):
         _env_eval_num = os.environ.get("EVAL_NUM")
         if str(_env_eval_num).lower() != "native":
             eval_num = min(int(_env_eval_num), int(eval_num))
+    if explicit_layout_ids is not None:
+        if eval_num != len(explicit_layout_ids):
+            raise ValueError("Resident shard layouts exceed the task native eval limit")
+        eval_cfg["layout_ids"] = explicit_layout_ids
     eval_cfg["eval_num"] = eval_num
     OmegaConf.update(env_cfg, "eval_cfg.eval_num", eval_num, force_add=True)
 

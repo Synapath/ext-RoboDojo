@@ -15,6 +15,8 @@ from utils.policy_execution import validate_horizon
 
 SCHEMA = "sim-service-resident-v2"
 HEX = re.compile(r"^[0-9a-f]{32}$")
+SHARD = re.compile(r"^shard-[0-9]{3,6}$")
+EXECUTION = re.compile(r"^[0-9a-f]{32}-shard-[0-9]{3,6}$")
 SPEC_FIELDS = {"task", "policy_adapter", "policy_host", "policy_port", "checkpoint_ref",
                "env_config", "action_type", "seed", "eval_num", "execution_horizon", "headless"}
 
@@ -210,7 +212,8 @@ def reset_renderer_history(context):
 
 def validate_request(value, session_id, sequence, previous_spec=None):
     if not isinstance(value, dict) or set(value) != {
-        "schema_version", "session_id", "sequence", "job_id", "request_hash", "nonce", "spec"
+        "schema_version", "session_id", "sequence", "job_id", "shard_id",
+        "execution_id", "layout_ids", "request_hash", "nonce", "spec"
     }:
         raise ValueError("Invalid resident request fields")
     if value["schema_version"] != SCHEMA or value["session_id"] != session_id:
@@ -220,11 +223,28 @@ def validate_request(value, session_id, sequence, previous_spec=None):
     for name in ("job_id", "nonce"):
         if not isinstance(value[name], str) or not HEX.fullmatch(value[name]):
             raise ValueError("Invalid resident identity")
+    if not isinstance(value["shard_id"], str) or not SHARD.fullmatch(value["shard_id"]):
+        raise ValueError("Invalid resident shard identity")
+    if not isinstance(value["execution_id"], str) or not EXECUTION.fullmatch(value["execution_id"]):
+        raise ValueError("Invalid resident execution identity")
+    if value["execution_id"] != f"{value['job_id']}-{value['shard_id']}":
+        raise ValueError("Resident execution identity mismatch")
+    layout_ids = value["layout_ids"]
+    if (
+        not isinstance(layout_ids, list)
+        or not layout_ids
+        or any(type(layout_id) is not int or layout_id < 0 for layout_id in layout_ids)
+        or layout_ids != sorted(layout_ids)
+        or len(set(layout_ids)) != len(layout_ids)
+    ):
+        raise ValueError("Invalid resident layout IDs")
     if not isinstance(value["request_hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["request_hash"]):
         raise ValueError("Invalid request hash")
     spec = value["spec"]
     if not isinstance(spec, dict) or set(spec) != SPEC_FIELDS or spec["headless"] is not True:
         raise ValueError("Invalid resident spec")
+    if type(spec["eval_num"]) is not int or spec["eval_num"] != len(layout_ids):
+        raise ValueError("Resident eval_num does not match assigned layouts")
     validate_horizon(spec["policy_adapter"], spec["execution_horizon"])
     if previous_spec is not None and spec["headless"] != previous_spec["headless"]:
         raise ValueError("Incompatible resident application")
@@ -318,13 +338,17 @@ def _serve_jobs(args, run_job, app, profile, owner):
             continue
         spec = validate_request(request, session_id, sequence, previous_spec)
         job_id = request["job_id"]
-        directory = root / "jobs" / job_id
+        execution_id = request["execution_id"]
+        directory = root / "jobs" / execution_id
         directory.mkdir(parents=True, exist_ok=False)
-        output = Path("eval_result") / job_id
+        output = Path("eval_result") / execution_id
         output.mkdir(exist_ok=False)
-        os.environ["ROBODOJO_RUN_ID"] = "service-" + job_id
+        os.environ["ROBODOJO_RUN_ID"] = "service-" + execution_id
         os.environ["ROBODOJO_OUTPUT_ROOT"] = str(output)
         os.environ["EVAL_NUM"] = str(spec["eval_num"])
+        os.environ["ROBODOJO_LAYOUT_IDS"] = json.dumps(request["layout_ids"])
+        os.environ["SIM_SERVICE_PARENT_JOB_ID"] = job_id
+        os.environ["SIM_SERVICE_SHARD_ID"] = request["shard_id"]
         if spec["policy_adapter"] == "Pi_05" and spec["execution_horizon"] is not None:
             os.environ["PI05_EXECUTION_HORIZON"] = str(spec["execution_horizon"])
         else:
@@ -337,7 +361,10 @@ def _serve_jobs(args, run_job, app, profile, owner):
         profile.__init__(enabled=os.environ.get("ROBODOJO_PROFILE") == "1")
         mode = environment_mode(spec, previous_spec)
         owner.builds, owner.retirements = 0, []
-        profile.metadata.update({"session_id": session_id, "sequence": sequence, "job_id": job_id,
+        profile.metadata.update({"session_id": session_id, "sequence": sequence,
+                                 "job_id": job_id, "shard_id": request["shard_id"],
+                                 "execution_id": execution_id,
+                                 "layout_ids": list(request["layout_ids"]),
                                  "warm": sequence > 1, "pid": os.getpid(), "application_id": id(app),
                                  "mode": mode, "environment_generation": sequence})
         if sequence == 1:

@@ -880,6 +880,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     "success": bool(self.success[env_idx]),
                     "score": episode_score,
                 }
+                if os.environ.get("SIM_SERVICE_PARENT_JOB_ID"):
+                    self.eval_result["details"][index].update(
+                        parent_job_id=os.environ["SIM_SERVICE_PARENT_JOB_ID"],
+                        shard_id=os.environ["SIM_SERVICE_SHARD_ID"],
+                    )
                 video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
                 videos = self.save_video(env_idx, video_path, tag)
                 telemetry = self.telemetry.pop(env_idx, None)
