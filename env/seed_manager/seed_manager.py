@@ -37,12 +37,29 @@ class SeedManager:
             key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
         )
 
-        matching_files = [str(p) for p in matching_files]
         self.seed_info = {}
-        for idx, file_path in enumerate(matching_files):
-            self.seed_info[idx] = {"scene_layout": file_path}
+        for path in matching_files:
+            layout_id = int(path.stem.rsplit("_", 1)[-1])
+            if layout_id in self.seed_info:
+                raise ValueError(f"Duplicate layout ID {layout_id} for {self.task_name}")
+            self.seed_info[layout_id] = {"scene_layout": str(path)}
 
-        all_layout_ids = list(range(len(matching_files)))
+        all_layout_ids = sorted(self.seed_info)
+        explicit = self.config.get("layout_ids")
+        if explicit is not None:
+            requested = list(explicit)
+            if (
+                not requested
+                or any(type(value) is not int for value in requested)
+                or requested != sorted(requested)
+                or len(set(requested)) != len(requested)
+                or any(value < 0 for value in requested)
+            ):
+                raise ValueError("Explicit layout IDs must be non-empty, sorted, and unique")
+            missing = sorted(set(requested) - set(all_layout_ids))
+            if missing:
+                raise ValueError(f"Explicit layout IDs are unavailable: {missing}")
+            all_layout_ids = requested
         excluded = set(int(s) for s in (completed_layout_ids or [])) | set(int(s) for s in (abandoned_layout_ids or []))
         if excluded:
             self.seed_list: List[int] = [s for s in all_layout_ids if s not in excluded]
