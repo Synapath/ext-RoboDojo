@@ -11,6 +11,7 @@ from omni.physx import acquire_physx_interface
 
 from env.environment.isaac.isaac_rl_env import IsaacRLEnv
 from env.seeding import seed_everywhere
+from utils.performance import profiled
 
 DEFAULT_SIM_DEVICE = "cpu"
 DEFAULT_USE_FABRIC = False
@@ -111,6 +112,7 @@ class BaseEnv(gym.Env):
         self.stage = get_current_stage()
         self.interactiveSceneCfg = kwargs.get("interactiveSceneCfg", None)
 
+    @profiled("environment_build")
     def launch_sim(self, config):
         """
         This function will launch the isaaclab simulation with the given configuration.
@@ -155,6 +157,7 @@ class BaseEnv(gym.Env):
         self.sim.env_spacing = self.env_spacing
         self.env_origins = self.sim.scene.env_origins
 
+    @profiled("render")
     def render(self):
         """
         Render the simulation. This will call the render function of the simulation backend.
@@ -181,6 +184,7 @@ class BaseEnv(gym.Env):
         _apply_render_settings(self.sim_cfg.sim.render, render_config, frequency_settings)
         _apply_physx_settings(self.sim_cfg.sim.physx, physx_config)
 
+    @profiled("physics_step")
     def sim_step(self, render: bool = True):
         """
         sim backend step
