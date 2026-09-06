@@ -126,3 +126,38 @@ def test_limits_and_errors_are_not_false_predicates(tmp_path):
     clock.append(env, 0, 100, 3)
     clock.append(env, 0, 90, 0)
     assert clock.status == "error"
+
+
+def test_annotation_transform_and_unsupported_scale():
+    s = np.sqrt(0.5)
+    p, r = m.transform_annotation([1, 2, 3, s, 0, 0, s], [2, 2, 2], [1, 0, 0, 1, 0, 0, 0])
+    np.testing.assert_allclose(p, [1, 4, 3], atol=1e-12)
+    np.testing.assert_allclose(r @ [1, 0, 0], [0, 1, 0], atol=1e-12)
+    with pytest.raises(ValueError, match="nonuniform"):
+        m.transform_annotation([0, 0, 0, 1, 0, 0, 0], [1, 2, 1], [0, 0, 0, 1, 0, 0, 0])
+
+
+def test_contact_window_impulses_separation_and_lost_event():
+    w = m.ContactWindow()
+    pair = ["charger", "finger", "charger/mesh", "finger/mesh"]
+    w.add(pair, "found", [([3, 4, 0], -0.001)])
+    w.add(pair, "persist", [([0, 0, 2], 0.003)])
+    w.add(pair, "lost", [])
+    row = w.drain()["pairs"][0]
+    assert row["point_count"] == 2
+    assert row["impulse_norm_sum_ns"] == 7 and row["impulse_norm_peak_ns"] == 5
+    assert row["minimum_separation_m"] == -0.001
+    assert row["events"] == dict(found=1, persist=1, lost=1)
+    assert w.drain()["pairs"] == []
+    w.add(pair, "found", [([0, np.nan, 0], 0)])
+    assert w.drain()["status"] == "error"
+    assert w.drain()["status"] == "error"  # no silent recovery of invalid measurement
+
+
+def test_contact_limit_and_isolation():
+    w, other = m.ContactWindow(), m.ContactWindow()
+    for i in range(65):
+        w.add([str(i), "b", "c", "d"], "found", [])
+    out = w.drain()
+    assert out["status"] == "error" and len(out["pairs"]) == 64
+    assert other.drain()["status"] == "reported"

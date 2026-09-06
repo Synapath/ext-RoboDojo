@@ -19,7 +19,7 @@ from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
 from utils.performance import profiled
 from utils.episode_telemetry import EpisodeTelemetry
-from utils.charger_diagnostics import ChargerDiagnostics
+from utils.charger_diagnostics import ChargerDiagnostics, ContactObserver
 from utils.policy_execution import execution_client
 
 
@@ -142,6 +142,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 and self.task_name == "plug_in_charger"
             )
             self.charger_diagnostics = {}
+            self.charger_contact_observer = None
             self.episode_nums = self.num_envs
             self.unstable_nums = 0
             self.unstable_envs: set[int] = set()
@@ -226,6 +227,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self._bind_observations_after_reset = self.sim is not None
 
         def close(self):
+            observer = getattr(self, "charger_contact_observer", None)
+            if observer is not None:
+                observer.close()
+                self.charger_contact_observer = None
             getattr(self, "telemetry", {}).clear()
             getattr(self, "telemetry_actions", {}).clear()
             getattr(self, "charger_diagnostics", {}).clear()
@@ -264,6 +269,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             # unstable) batch before starting a fresh one.
             self._abort_video_writers()
             self.charger_diagnostics.clear()
+            if self.charger_contact_observer is not None:
+                self.charger_contact_observer.close()
+                self.charger_contact_observer = None
             self.episode_nums = len(real_indices)
             self.unstable_envs = set()
 
@@ -289,6 +297,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.reward_manager.init_state()
 
             self.model_client.call(func_name="reset")
+            if self.charger_diagnostics_enabled and os.environ.get("ROBODOJO_CHARGER_CONTACTS") == "1":
+                self.charger_contact_observer = ContactObserver(self)
 
         def setup_scene(self):
             self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
@@ -903,13 +913,16 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 videos = self.save_video(env_idx, video_path, tag)
                 diagnostics = self.charger_diagnostics.pop(env_idx, None)
                 if diagnostics is not None:
-                    diagnostics.save(
-                        os.path.join(self.save_dir, f"episode_{index:07d}.charger-diagnostics.json"),
-                        {"task": self.task_name, "env_config": self.config_name, "seed": int(self.eval_seed),
-                         "episode": int(index), "layout_id": int(self.env_seeds[env_idx])},
-                        success=bool(self.success[env_idx]), action_count=int(self.take_action_cnt[env_idx]),
-                        step_limit=int(self.step_lim),
-                    )
+                    try:
+                        diagnostics.save(
+                            os.path.join(self.save_dir, f"episode_{index:07d}.charger-diagnostics.json"),
+                            {"task": self.task_name, "env_config": self.config_name, "seed": int(self.eval_seed),
+                             "episode": int(index), "layout_id": int(self.env_seeds[env_idx])},
+                            success=bool(self.success[env_idx]), action_count=int(self.take_action_cnt[env_idx]),
+                            step_limit=int(self.step_lim),
+                        )
+                    except Exception as exc:
+                        print(f"CHARGER_DIAGNOSTICS_SAVE_ERROR episode={index}: {type(exc).__name__}: {exc}", flush=True)
                 telemetry = self.telemetry.pop(env_idx, None)
                 if telemetry is not None:
                     telemetry.save(
