@@ -213,19 +213,29 @@ class ContactObserver:
         self.windows = {i: ContactWindow() for i in range(env.num_envs)}
         self.subscription = None
         self.paths = {}
+        self.callbacks = 0
+        self.headers_seen = 0
+        self.headers_matched = 0
+        self.settings = None
+        self.previous_contact_processing = None
         try:
             from pxr import PhysxSchema
+            import carb.settings
             import omni.usd
             from omni.physx import get_physx_simulation_interface
 
             stage = omni.usd.get_context().get_stage()
+            self.settings = carb.settings.get_settings()
+            self.previous_contact_processing = self.settings.get_as_bool("/physics/disableContactProcessing")
+            self.settings.set_bool("/physics/disableContactProcessing", False)
             lm = env.scene_manager.layout_manager
             for i in range(env.num_envs):
                 name = lm.get_instance_name(label="charger", env_idx=i)
                 obj = lm.get_scene_object(env_idx=i, inst_name=name)
                 path = str(obj.prim_path)
-                api = PhysxSchema.PhysxContactReportAPI.Apply(stage.GetPrimAtPath(path))
-                api.CreateThresholdAttr().Set(0.0)
+                prim = stage.GetPrimAtPath(path)
+                if not prim.HasAPI(PhysxSchema.PhysxContactReportAPI):
+                    raise ValueError("charger contact reporting was not enabled before physics initialization")
                 self.paths[path] = i
             # Weak callback avoids retaining a retired Isaac environment via subscription.
             owner = weakref.ref(self)
@@ -242,6 +252,8 @@ class ContactObserver:
 
     def receive(self, headers, data):
         try:
+            self.callbacks += 1
+            self.headers_seen += len(headers)
             from pxr import PhysicsSchemaTools
 
             for header in headers:
@@ -252,8 +264,9 @@ class ContactObserver:
                 ids = {i for root, i in self.paths.items() if any(p == root or p.startswith(root + "/") for p in paths)}
                 if not ids:
                     continue
+                self.headers_matched += 1
                 count, offset = header.num_contact_data, header.contact_data_offset
-                if count > 4096 or count < 0 or offset < 0 or offset + count > len(data):
+                if count > 4096 or count < 0 or (count > 0 and (offset < 0 or offset + count > len(data))):
                     raise ValueError("contact callback data limit/range")
                 points = [(list(data[k].impulse), float(data[k].separation)) for k in range(offset, offset + count)]
                 for i in ids:
@@ -263,10 +276,15 @@ class ContactObserver:
                 window.error = f"contact callback: {type(exc).__name__}: {exc}"
 
     def drain(self, env_idx):
-        return self.windows[env_idx].drain()
+        result = self.windows[env_idx].drain()
+        result.update(callback_count=self.callbacks, headers_seen=self.headers_seen, headers_matched=self.headers_matched)
+        return result
 
     def close(self):
         self.subscription = None
+        if self.settings is not None and self.previous_contact_processing is not None:
+            self.settings.set_bool("/physics/disableContactProcessing", self.previous_contact_processing)
+        self.settings = None
         self.windows.clear()
 
 

@@ -286,7 +286,19 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 else:
                     self.current_env_seed_map[idx] = seed[idx]
 
-            super().reset(seed=self.env_seeds, options=options)
+            setup_key = "ROBODOJO_CHARGER_CONTACT_ASSET_SETUP"
+            previous_setup = os.environ.get(setup_key)
+            try:
+                if self.charger_diagnostics_enabled and os.environ.get("ROBODOJO_CHARGER_CONTACTS") == "1":
+                    os.environ[setup_key] = "1"
+                else:
+                    os.environ.pop(setup_key, None)
+                super().reset(seed=self.env_seeds, options=options)
+            finally:
+                if previous_setup is None:
+                    os.environ.pop(setup_key, None)
+                else:
+                    os.environ[setup_key] = previous_setup
             if self._bind_observations_after_reset:
                 self.obs_manager.initialize(self)
                 self._bind_observations_after_reset = False
