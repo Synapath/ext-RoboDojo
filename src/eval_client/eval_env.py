@@ -277,9 +277,22 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
             self.current_env_seed_map = {}
             for idx in range(self.num_envs):
-                self.scene_manager.layout_manager.set_saved_layout(
-                    idx, self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
-                )
+                layout = self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
+                raw_xy = os.environ.get("ROBODOJO_CHARGER_SOCKET_XY")
+                if raw_xy is not None:
+                    from pathlib import Path
+                    from utils.charger_intervention import shifted_socket_layout
+
+                    info = dict(part.split("=", 1) for part in self.additional_info.split(",") if "=" in part)
+                    layout, receipt = shifted_socket_layout(
+                        layout, raw_xy, task=self.task_name,
+                        checkpoint=info.get("ckpt_name", ""), diagnostics=self.charger_diagnostics_enabled,
+                    )
+                    receipt.update(layout_id=int(self.env_seeds[idx]), env_idx=idx, seed=self.eval_seed)
+                    target = Path(self.save_dir) / f"intervention-layout-{self.env_seeds[idx]}-env-{idx}.json"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(json.dumps(receipt, indent=2, allow_nan=False) + "\n")
+                self.scene_manager.layout_manager.set_saved_layout(idx, layout)
                 if seed[idx] is None:
                     self.success[idx] = False
                     self.end_flag[idx] = True
