@@ -1,0 +1,159 @@
+"""Read-only charger measurements, separate from policy observations and reward state."""
+
+import json
+import math
+import os
+from pathlib import Path
+
+import numpy as np
+
+
+def rotation_wxyz(quaternion):
+    q = np.asarray(quaternion, dtype=float)
+    if q.shape != (4,) or not np.isfinite(q).all() or np.linalg.norm(q) < 1e-12:
+        raise ValueError("invalid quaternion")
+    w, x, y, z = q / np.linalg.norm(q)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def geometry(charger_pose, socket_pose, charger_bbox=None, socket_bbox=None):
+    a, b = np.asarray(charger_pose, dtype=float), np.asarray(socket_pose, dtype=float)
+    if a.shape != (7,) or b.shape != (7,) or not np.isfinite([a, b]).all():
+        raise ValueError("invalid object pose")
+    ra, rb = rotation_wxyz(a[3:]), rotation_wxyz(b[3:])
+    result = {
+        "charger_root_in_socket_frame_m": (rb.T @ (a[:3] - b[:3])).tolist(),
+        "charger_axis_up_angle_deg": float(np.degrees(np.arccos(np.clip(ra[2, 1], -1.0, 1.0)))),
+        "bbox_z_overlap_proxy_m": None,
+        "plug_tip_hole_error_m": None,
+        "physical_insertion_depth_m": None,
+    }
+    if charger_bbox is not None and socket_bbox is not None:
+        aa, bb = np.asarray(charger_bbox, dtype=float), np.asarray(socket_bbox, dtype=float)
+        for box in (aa, bb):
+            if box.ndim != 2 or box.shape[1] != 3 or len(box) < 4 or not np.isfinite(box).all():
+                raise ValueError("invalid bounding box")
+        az = (aa @ ra.T + a[:3])[:, 2]
+        bz = (bb @ rb.T + b[:3])[:, 2]
+        result["bbox_z_overlap_proxy_m"] = float(bz.max() - az.min())
+    return result
+
+
+def snapshot(env, env_idx):
+    """Call only existing pose getters and four instantaneous, read-only predicates."""
+    lm, parser = env.scene_manager.layout_manager, env.reward_manager.func_parser
+    poses, boxes = {}, {}
+    for label in ("charger", "socket"):
+        name = lm.get_instance_name(label=label, env_idx=env_idx)
+        if name is None:
+            raise ValueError(f"missing {label} instance")
+        pos, quat = lm.get_instance_pose(inst_name=name, env_idx=env_idx)
+        poses[label] = np.concatenate([pos, quat]).astype(float).tolist()
+        boxes[label] = lm.get_instance_bbox_vertices(inst_name=name, env_idx=env_idx)
+    metrics = geometry(poses["charger"], poses["socket"], boxes["charger"], boxes["socket"])
+    ab = {"env_idx": env_idx, "label_A": "charger", "label_B": "socket"}
+    native = {
+        "depth": parser.is_A_depth_in_B(dict(ab, z_threshold=0.015)),
+        "inside": parser.is_A_in_B(dict(ab)),
+        "upright": parser.is_axis_up({"env_idx": env_idx, "label": "charger", "axis": [0, 1, 0], "threshold": 10}),
+        "home": parser.all_robot_back_to_origin({"env_idx": env_idx, "pos_threshold": 0.15, "rot_threshold": 20}),
+    }
+    if any(float(value) not in (0.0, 1.0) for value in native.values()):
+        raise ValueError("non-binary native predicate")
+    native = {key: bool(value) for key, value in native.items()}
+    return {
+        "poses_env_local_m_wxyz": poses,
+        "geometry": metrics,
+        "native_instantaneous": dict(native, all=all(native.values())),
+        "contact_force_n": None,
+        "held_by_arm": None,
+        "missing": {
+            "contact_force_n": "deployed rigid contact-force tracking is disabled",
+            "held_by_arm": "no calibrated grasp/contact source; gripper commands are insufficient",
+            "plug_tip_hole_error_m": "asset functional points not yet calibrated",
+            "physical_insertion_depth_m": "bbox overlap is not plug-tip penetration",
+        },
+    }
+
+
+class ChargerDiagnostics:
+    MAX_SAMPLES = 1001
+    MAX_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, physics_dt):
+        if not math.isfinite(physics_dt) or physics_dt <= 0:
+            raise ValueError("invalid physics dt")
+        self.dt = float(physics_dt)
+        self.rows = []
+        self.errors = []
+        self.status = "complete"
+        self.bytes_used = 0
+        self.origin_step = None
+
+    def append(self, env, env_idx, step, action_count):
+        if self.status != "complete":
+            return
+        try:
+            if type(step) is not int or type(action_count) is not int or action_count < 0:
+                raise ValueError("invalid clock")
+            if self.rows:
+                previous = self.rows[-1]
+                if step == previous["physics_step"] and action_count == previous["action_count"]:
+                    return
+                if step <= previous["physics_step"] or action_count < previous["action_count"]:
+                    raise ValueError("non-monotonic clock or reset without new recorder")
+            if self.origin_step is None:
+                self.origin_step = step
+            row = {
+                "physics_step": step,
+                "action_count": action_count,
+                "time_seconds": (step - self.origin_step) * self.dt,
+                **snapshot(env, env_idx),
+            }
+            encoded = json.dumps(row, allow_nan=False, separators=(",", ":"))
+            if len(self.rows) >= self.MAX_SAMPLES or self.bytes_used + len(encoded.encode()) > self.MAX_BYTES:
+                self.status = "truncated"
+                return
+            self.rows.append(json.loads(encoded))
+            self.bytes_used += len(encoded.encode())
+        except Exception as exc:
+            # A diagnostic failure must not alter the native policy/scorer path.
+            self.status = "error"
+            self.errors.append(
+                {"step": step, "action_count": action_count, "type": type(exc).__name__, "message": str(exc)[:512]}
+            )
+
+    def save(self, path, identity, *, success, action_count, step_limit):
+        path = Path(path)
+        payload = {
+            "schema_version": "charger-diagnostics-v1",
+            "identity": identity,
+            "status": self.status,
+            "errors": self.errors,
+            "physics_dt": self.dt,
+            "origin_step": self.origin_step,
+            "rows": self.rows,
+            "terminal": {
+                "native_success": bool(success),
+                "terminated": bool(success),
+                "truncated": not success and action_count >= step_limit,
+                "reason": "success" if success else "time_limit" if action_count >= step_limit else "incomplete",
+                "action_count": action_count,
+                "step_limit": step_limit,
+            },
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".partial")
+        with temporary.open("x") as stream:
+            json.dump(payload, stream, allow_nan=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Atomic publication without replacing old evidence (including a symlink).
+        os.link(temporary, path)
+        temporary.unlink()
