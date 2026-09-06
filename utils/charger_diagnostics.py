@@ -17,6 +17,52 @@ def cpu_array(value):
     return np.asarray(value, dtype=float)
 
 
+def observation_digest(value):
+    """Hash an observation without serializing its large arrays to JSON."""
+    digest = hashlib.sha256()
+
+    def visit(item):
+        if hasattr(item, "detach"):
+            item = item.detach().cpu().numpy()
+        if isinstance(item, (np.ndarray, np.generic)):
+            array = np.asarray(item)
+            if array.dtype.hasobject:
+                raise ValueError("object array in observation")
+            digest.update(b"numpy-scalar" if isinstance(item, np.generic) else b"array")
+            digest.update(array.dtype.str.encode() + json.dumps(array.shape).encode())
+            digest.update(array.tobytes())
+            digest.update(b"end-array")
+        elif isinstance(item, dict):
+            digest.update(b"dict")
+            for key in sorted(item):
+                visit(key)
+                visit(item[key])
+            digest.update(b"end-dict")
+        elif isinstance(item, (tuple, list)):
+            digest.update(f"sequence:{len(item)}".encode())
+            for child in item:
+                visit(child)
+            digest.update(b"end-sequence")
+        else:
+            digest.update(json.dumps(item, allow_nan=False, sort_keys=True).encode() + b"\x00")
+
+    visit(value)
+    return digest.hexdigest()
+
+
+def observer_integrity(env, env_idx, observation):
+    result = {
+        "observation_sha256": observation_digest(observation),
+        "physics_step": int(env.sim._sim_step_counter),
+        "action_count": int(env.take_action_cnt[env_idx]),
+        "reward_queue_lengths": {},
+    }
+    for key in ("check_list", "final_check_list", "query_list", "trigger_check_list", "score_list"):
+        queues = getattr(env.reward_manager, key, None)
+        result["reward_queue_lengths"][key] = len(queues[env_idx]) if queues is not None else None
+    return result
+
+
 def rotation_wxyz(quaternion):
     q = np.asarray(quaternion, dtype=float)
     if q.shape != (4,) or not np.isfinite(q).all() or np.linalg.norm(q) < 1e-12:
@@ -277,7 +323,9 @@ class ContactObserver:
 
     def drain(self, env_idx):
         result = self.windows[env_idx].drain()
-        result.update(callback_count=self.callbacks, headers_seen=self.headers_seen, headers_matched=self.headers_matched)
+        result.update(
+            callback_count=self.callbacks, headers_seen=self.headers_seen, headers_matched=self.headers_matched
+        )
         return result
 
     def close(self):
@@ -302,7 +350,7 @@ class ChargerDiagnostics:
         self.bytes_used = 0
         self.origin_step = None
 
-    def append(self, env, env_idx, step, action_count):
+    def append(self, env, env_idx, step, action_count, observation=None):
         if self.status != "complete":
             return
         try:
@@ -316,12 +364,18 @@ class ChargerDiagnostics:
                     raise ValueError("non-monotonic clock or reset without new recorder")
             if self.origin_step is None:
                 self.origin_step = step
+            before = observer_integrity(env, env_idx, observation) if observation is not None else None
             row = {
                 "physics_step": step,
                 "action_count": action_count,
                 "time_seconds": (step - self.origin_step) * self.dt,
                 **snapshot(env, env_idx),
             }
+            if before is not None:
+                after = observer_integrity(env, env_idx, observation)
+                if before != after:
+                    raise ValueError("diagnostic collection changed observation, clock, action count or reward queues")
+                row["observer_integrity"] = {"status": "unchanged", "before": before, "after": after}
             encoded = json.dumps(row, allow_nan=False, separators=(",", ":"))
             if len(self.rows) >= self.MAX_SAMPLES or self.bytes_used + len(encoded.encode()) > self.MAX_BYTES:
                 self.status = "truncated"

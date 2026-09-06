@@ -359,6 +359,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                             self.charger_diagnostics[env_idx] = ChargerDiagnostics(self.sim.physics_dt)
                         self.charger_diagnostics[env_idx].append(
                             self, env_idx, int(self.sim._sim_step_counter), int(self.take_action_cnt[env_idx]),
+                            observation=data[env_idx] if os.environ.get("ROBODOJO_CHARGER_DIAGNOSTICS_VERIFY") == "1" else None,
                         )
                     if self.telemetry_enabled:
                         if env_idx not in self.telemetry:

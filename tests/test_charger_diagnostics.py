@@ -173,3 +173,33 @@ def test_pose_getter_tensor_detaches_before_numpy():
     out = m.snapshot(env, 0)
     assert out["poses_env_local_m_wxyz"]["charger"] == [1, 2, 3, 1, 0, 0, 0]
     assert pos.grad is None and quat.grad is None
+
+
+def test_same_observation_integrity_detects_mutation_without_advancing_sim():
+    env, _, parser = environment()
+    env.sim = SimpleNamespace(_sim_step_counter=100)
+    env.take_action_cnt = [0]
+    observation = {"image": np.zeros((3, 4, 5), dtype=np.uint8), "state": [0.0, 1.0]}
+    recorder = m.ChargerDiagnostics(0.004)
+    recorder.append(env, 0, 100, 0, observation=observation)
+    assert recorder.rows[0]["observer_integrity"]["status"] == "unchanged"
+    original = parser.is_A_in_B
+
+    def corrupt(args):
+        observation["image"][0, 0, 0] = 1
+        return original(args)
+
+    parser.is_A_in_B = corrupt
+    recorder = m.ChargerDiagnostics(0.004)
+    recorder.append(env, 0, 100, 0, observation=observation)
+    assert recorder.status == "error" and "changed observation" in recorder.errors[0]["message"]
+    assert env.sim._sim_step_counter == 100
+
+
+def test_observation_digest_accounts_for_dtype_shape_and_nested_values():
+    a = np.array([1, 2], dtype=np.uint8)
+    assert m.observation_digest({"a": a, "b": None}) == m.observation_digest({"b": None, "a": a.copy()})
+    assert m.observation_digest(a) != m.observation_digest(a.astype(np.int32))
+    assert m.observation_digest(a) != m.observation_digest(a.reshape(1, 2))
+    assert m.observation_digest({"a": {"b": 1}}) != m.observation_digest({"a": {}, "b": 1})
+    assert m.observation_digest(np.int32(1)) != m.observation_digest(np.array(1, dtype=np.int32))
