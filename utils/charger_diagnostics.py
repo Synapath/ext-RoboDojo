@@ -10,6 +10,13 @@ from pathlib import Path
 import numpy as np
 
 
+def cpu_array(value):
+    """Existing Isaac getters can return CPU or CUDA tensors."""
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=float)
+
+
 def rotation_wxyz(quaternion):
     q = np.asarray(quaternion, dtype=float)
     if q.shape != (4,) or not np.isfinite(q).all() or np.linalg.norm(q) < 1e-12:
@@ -56,7 +63,7 @@ def snapshot(env, env_idx):
         if name is None:
             raise ValueError(f"missing {label} instance")
         pos, quat = lm.get_instance_pose(inst_name=name, env_idx=env_idx)
-        poses[label] = np.concatenate([pos, quat]).astype(float).tolist()
+        poses[label] = np.concatenate([cpu_array(pos), cpu_array(quat)]).tolist()
         boxes[label] = lm.get_instance_bbox_vertices(inst_name=name, env_idx=env_idx)
     metrics = geometry(poses["charger"], poses["socket"], boxes["charger"], boxes["socket"])
     ab = {"env_idx": env_idx, "label_A": "charger", "label_B": "socket"}
@@ -99,7 +106,7 @@ def annotated_alignment(lm, env_idx, poses):
         if item is None:
             return {"status": "missing", "reason": f"missing {label} metadata"}
         obj = lm.get_scene_object(env_idx=env_idx, inst_name=name)
-        scale = np.asarray(obj.get_local_scale(), dtype=float)
+        scale = cpu_array(obj.get_local_scale())
         if scale.shape != (3,) or not np.isfinite(scale).all() or (scale <= 0).any():
             raise ValueError("invalid annotation scale")
         metadata[label], scales[label] = item, scale

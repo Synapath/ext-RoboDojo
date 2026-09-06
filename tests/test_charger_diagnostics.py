@@ -161,3 +161,15 @@ def test_contact_limit_and_isolation():
     out = w.drain()
     assert out["status"] == "error" and len(out["pairs"]) == 64
     assert other.drain()["status"] == "reported"
+
+
+def test_pose_getter_tensor_detaches_before_numpy():
+    import torch
+
+    env, _, _ = environment()
+    pos = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], requires_grad=True)
+    env.scene_manager.layout_manager.get_instance_pose = lambda **kw: (pos, quat)
+    out = m.snapshot(env, 0)
+    assert out["poses_env_local_m_wxyz"]["charger"] == [1, 2, 3, 1, 0, 0, 0]
+    assert pos.grad is None and quat.grad is None
