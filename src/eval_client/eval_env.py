@@ -130,6 +130,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.success = [True] * self.num_envs
             self.end_flag = [False] * self.num_envs
             self.take_action_cnt = [0] * self.num_envs
+            self.rlt_observations = {}
+            self.rlt_applied_actions = {}
             # Per-env streaming video writers: {env_idx: {camera_key: writer}}.
             # Replaces the old full-episode frame cache; only vision frames are
             # streamed to disk as they arrive instead of buffered in RAM.
@@ -142,6 +144,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 and self.task_name == "plug_in_charger"
             )
             self.charger_diagnostics = {}
+            self.rlt_observations = {}
+            self.rlt_applied_actions = {}
             self.charger_contact_observer = None
             self.episode_nums = self.num_envs
             self.unstable_nums = 0
@@ -265,6 +269,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.success = [True] * self.num_envs
             self.end_flag = [False] * self.num_envs
             self.take_action_cnt = [0] * self.num_envs
+            self.rlt_observations = {}
+            self.rlt_applied_actions = {}
             # Discard any writers left open by a previous (e.g. crashed or
             # unstable) batch before starting a fresh one.
             self._abort_video_writers()
@@ -389,6 +395,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         )
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
+                if os.environ.get("ROBODOJO_RLT_INTERACTION") == "1":
+                    self.rlt_observations[env_idx] = (int(self.take_action_cnt[env_idx]), deepcopy(env_data))
                 data_list.append(env_data)
             return data_list
 
@@ -558,6 +566,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                             }
                         else:
                             pass
+                if os.environ.get("ROBODOJO_RLT_INTERACTION") == "1":
+                    applied = deepcopy(action)
+                    for robot in self.robot_manager.robot_list:
+                        if robot.type == "target" and robot.ee_type == "gripper":
+                            key = self.robot_manager.process_name(robot.gripper_name)
+                            applied[key] = [float(np.clip(applied[key][0], 0, 1))]
+                    self.rlt_applied_actions[env_idx] = applied
                 control_seq = self.process_control_info(control_info, env_idx)
                 control_info_list.append(control_seq)
 
