@@ -6,11 +6,21 @@ from pathlib import Path
 import tempfile
 
 from utils.camera_readback import selected_frames_to_numpy
-from utils.performance import WallProfile, close_profiled_app
+from utils.performance import WallProfile, close_profiled_app, app_performance_options
 from utils.eval_allocation import effective_num_envs
 
 
 class RuntimePerformanceTests(unittest.TestCase):
+    def test_optional_tuning_preserves_defaults_and_rejects_gui_viewport_override(self):
+        self.assertEqual(app_performance_options({}, headless=True), {})
+        self.assertEqual(app_performance_options({"ROBODOJO_DISABLE_VIEWPORT": "1",
+                                                 "ROBODOJO_CPU_THREADS": "16"}, headless=True),
+                         {"disable_viewport_updates": True, "limit_cpu_threads": 16})
+        with self.assertRaises(ValueError):
+            app_performance_options({"ROBODOJO_DISABLE_VIEWPORT": "1"}, headless=False)
+        with self.assertRaises(ValueError):
+            app_performance_options({"ROBODOJO_CPU_THREADS": "0"}, headless=True)
+
     def test_profile_persisted_before_nonreturning_kit_shutdown(self):
         profile = WallProfile(True)
         with tempfile.TemporaryDirectory() as directory:

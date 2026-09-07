@@ -9,6 +9,24 @@ from pathlib import Path
 import time
 
 
+def app_performance_options(environ, *, headless):
+    """Explicit, opt-in process tuning; physics and sensor settings stay unchanged."""
+    options = {}
+    viewport = environ.get("ROBODOJO_DISABLE_VIEWPORT", "0")
+    if viewport not in {"0", "1"}:
+        raise ValueError("ROBODOJO_DISABLE_VIEWPORT must be 0 or 1")
+    if viewport == "1":
+        if not headless:
+            raise ValueError("viewport suppression requires headless mode")
+        options["disable_viewport_updates"] = True
+    if "ROBODOJO_CPU_THREADS" in environ:
+        threads = int(environ["ROBODOJO_CPU_THREADS"])
+        if not 1 <= threads <= 64:
+            raise ValueError("ROBODOJO_CPU_THREADS must be in 1..64")
+        options["limit_cpu_threads"] = threads
+    return options
+
+
 class WallProfile:
     def __init__(self, enabled=False, clock=time.perf_counter):
         self.enabled = enabled

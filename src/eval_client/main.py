@@ -5,7 +5,7 @@ import json
 import os
 import sys
 
-from utils.performance import PROFILE, close_profiled_app
+from utils.performance import PROFILE, close_profiled_app, app_performance_options
 from utils.eval_allocation import effective_num_envs
 
 from isaaclab.app import AppLauncher
@@ -125,7 +125,8 @@ if enable_monitor or args_cli.service_session:
     get_monitor().start(enabled=True)
 
 # launch omniverse app
-app_launcher = AppLauncher(args_cli)
+performance_options = app_performance_options(os.environ, headless=args_cli.headless)
+app_launcher = AppLauncher(args_cli, **performance_options)
 simulation_app = app_launcher.app
 
 from omegaconf import OmegaConf
