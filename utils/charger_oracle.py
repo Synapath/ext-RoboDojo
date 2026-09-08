@@ -56,6 +56,8 @@ class ChargerOracle:
         self.progress = []
         self.finishing = None
         self.grip = None
+        self.settled_chunks = 0
+        self.completed = False
 
     def _frames(self, row, selected):
         lm = self.env.scene_manager.layout_manager
@@ -76,6 +78,8 @@ class ChargerOracle:
     def propose(self, frame, gate_row, actor_proposal):
         meta = {"strategy": self.config["strategy"], "reason": "actor", "bc_eligible": False}
         step = frame["step"]
+        if self.completed:
+            return None, {**meta, "reason": "correction_complete"}
         holder = {"L": "left", "R": "right"}.get(gate_row.get("holding_proxy"))
         if self.finishing is None and holder not in {"left", "right"}:
             self.started = None
@@ -106,6 +110,17 @@ class ChargerOracle:
             self.grip = float(frame["proprio"][6 if holder == "left" else 13])
         if step - self.started >= self.config.get("max_intervention_steps", 180):
             return None, {**meta, "reason": "intervention_limit"}
+        # A correction ends on an observable state, rather than requiring the
+        # actor to imitate repeated idle commands until an invisible timer ends.
+        native = frame["diagnostics"]["native_instantaneous"]
+        settled = (selected["lateral_m"] <= self.config.get("settled_lateral_m", 0.0015)
+                   and abs(selected["axial_m"] - self.config.get("insert_m", -0.008)) <= 0.001
+                   and selected["rotation_error_deg"] <= 2
+                   and native["inside"] and native["upright"])
+        self.settled_chunks = self.settled_chunks + 1 if settled else 0
+        if self.config.get("yield_when_settled", False) and self.settled_chunks >= 2:
+            self.completed = True
+            return None, {**meta, "reason": "correction_complete"}
         rm = self.env.robot_manager
         robot = rm.get_robot_by_arm_name(self.holder + "_arm")
         offset = 0 if self.holder == "left" else 7

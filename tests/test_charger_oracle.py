@@ -1,5 +1,5 @@
 import numpy as np
-from utils.charger_oracle import target_end_link, pose_matrix, choose_target
+from utils.charger_oracle import ChargerOracle, target_end_link, pose_matrix, choose_target
 
 
 def test_nearest_position_must_not_select_opposite_insertion_frame():
@@ -27,3 +27,18 @@ def test_axial_offset_follows_target_frame_not_world_z():
     target[:3, :3] = [[0, 0, 1], [0, 1, 0], [-1, 0, 0]]
     actual = target_end_link(obj, ee, insert, target, 0.005, 0.01, 6)
     np.testing.assert_allclose(actual[:3], [0.005, 0, 0], atol=1e-10)
+
+
+def test_settled_correction_returns_control_and_does_not_restart():
+    oracle = ChargerOracle(None, dict(strategy="immediate", yield_when_settled=True))
+    oracle.started, oracle.holder, oracle.settled_chunks = 100, "left", 1
+    target = dict(insert_frame=1, support="slot", support_frame=0,
+                  lateral_m=0.0008, axial_m=-0.0082, rotation_error_deg=0.5)
+    frame = dict(step=140, diagnostics={"annotated_alignment": {"targets": [target]},
+                                       "native_instantaneous": {"inside": True, "upright": True}})
+    action, metadata = oracle.propose(frame, {"holding_proxy": "L"}, None)
+    assert action is None and metadata["reason"] == "correction_complete"
+    assert not metadata["bc_eligible"]
+    # Once handed back, later loss of the holding proxy does not restart Oracle.
+    action, metadata = oracle.propose({"step": 150}, {}, None)
+    assert action is None and metadata["reason"] == "correction_complete"
