@@ -48,8 +48,17 @@ def target_end_link(current_object, current_ee, insert_frame, target_frame,
 class ChargerOracle:
     def __init__(self, env, config):
         self.env, self.config = env, dict(config)
-        if config.get("strategy") not in {"immediate", "stalled"}:
-            raise ValueError("Oracle strategy must be immediate or stalled")
+        if config.get("strategy") not in {"immediate", "stalled", "recovery_pulse"}:
+            raise ValueError("unknown Oracle strategy")
+        if config.get("strategy") == "recovery_pulse":
+            n = config.get("actor_prefix_steps")
+            if type(n) is not int or not 1 <= n < 10:
+                raise ValueError("actor_prefix_steps must be an integer in [1, 9]")
+            for key, default in (("recovery_shift_m", 0.01), ("recovery_rotation_deg", 10),
+                                 ("recovery_steps", 10)):
+                value = config.get(key, default)
+                if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
+                    raise ValueError("invalid recovery limit: " + key)
         self.holder = None
         self.target_key = None
         self.started = None
@@ -58,6 +67,45 @@ class ChargerOracle:
         self.grip = None
         self.settled_chunks = 0
         self.completed = False
+        self.pulse_due = True
+        self.hold_anchor = None
+        self.hold_step = None
+        self.pulse_stop_reason = None
+
+    def _relative_object_pose(self, frame, holder):
+        rm = self.env.robot_manager
+        robot = rm.get_robot_by_arm_name(holder + "_arm")
+        ee = rm.get_real_endpose(robot, [0], is_relative=True)[0]
+        obj = frame["diagnostics"]["poses_env_local_m_wxyz"]["charger"]
+        return np.linalg.inv(pose_matrix(ee)) @ pose_matrix(obj)
+
+    def _pulse_gate(self, frame, gate_row):
+        """Recover only a recently observed, still contact-supported holder."""
+        holder = {"L": "left", "R": "right"}.get(gate_row.get("holding_proxy"))
+        if holder:
+            if self.holder is not None and self.holder != holder:
+                return None, {"reason": "holder_changed"}
+            self.holder = holder
+            self.hold_anchor = self._relative_object_pose(frame, holder)
+            self.hold_step = frame["step"]
+            if self.grip is None:
+                self.grip = float(frame["proprio"][6 if holder == "left" else 13])
+            return gate_row, {"holder_mode": "stable_proxy"}
+        if self.hold_anchor is None or frame["step"] - self.hold_step > self.config.get("recovery_steps", 10):
+            return None, {"reason": "no_recent_holder"}
+        side = "L" if self.holder == "left" else "R"
+        contacts = gate_row.get("bilateral_contacts", {})
+        if not contacts.get(side) or contacts.get("R" if side == "L" else "L"):
+            return None, {"reason": "no_unambiguous_bilateral_contact"}
+        relative = self._relative_object_pose(frame, self.holder)
+        shift = float(np.linalg.norm(relative[:3, 3] - self.hold_anchor[:3, 3]))
+        rotation = float(np.rad2deg(Rotation.from_matrix(
+            self.hold_anchor[:3, :3].T @ relative[:3, :3]).magnitude()))
+        detail = {"holder_mode": "contact_recovery", "relative_shift_m": shift,
+                  "relative_rotation_deg": rotation}
+        if shift > self.config.get("recovery_shift_m", 0.01) or rotation > self.config.get("recovery_rotation_deg", 10):
+            return None, {**detail, "reason": "relative_grasp_drift"}
+        return {**gate_row, "holding_proxy": side}, detail
 
     def _frames(self, row, selected):
         lm = self.env.scene_manager.layout_manager
@@ -76,6 +124,34 @@ class ChargerOracle:
         return result
 
     def propose(self, frame, gate_row, actor_proposal):
+        if self.config["strategy"] != "recovery_pulse":
+            return self._correction(frame, gate_row, actor_proposal)
+        meta = {"strategy": "recovery_pulse", "bc_eligible": False}
+        if self.completed:
+            return None, {**meta, "reason": "correction_complete"}
+        if self.started is not None and frame["step"] - self.started >= self.config.get("max_intervention_steps", 180):
+            self.pulse_stop_reason = "intervention_limit"
+        if self.pulse_stop_reason:
+            return None, {**meta, "reason": self.pulse_stop_reason}
+        if self.finishing is None:
+            recovered, detail = self._pulse_gate(frame, gate_row)
+            if recovered is None:
+                return None, {**meta, **detail}
+            # Only stable states permit another actor pulse. A contact recovery
+            # keeps correcting until the ordinary holding proxy is stable again.
+            if self.pulse_due and gate_row.get("holding_proxy") and not gate_row.get("native_insertion_three"):
+                self.pulse_due = False
+                return None, {**meta, **detail, "reason": "actor_pulse",
+                              "actor_prefix_steps": self.config["actor_prefix_steps"]}
+            gate_row = recovered
+        else:
+            detail = {"holder_mode": "finishing"}
+        command, info = self._correction(frame, gate_row, actor_proposal)
+        if command is not None:
+            self.pulse_due = True
+        return command, {**info, **detail}
+
+    def _correction(self, frame, gate_row, actor_proposal):
         meta = {"strategy": self.config["strategy"], "reason": "actor", "bc_eligible": False}
         step = frame["step"]
         if self.completed:
@@ -107,7 +183,8 @@ class ChargerOracle:
                 if not stalled:
                     return None, meta
             self.started, self.holder, self.target_key = step, holder, key(selected)
-            self.grip = float(frame["proprio"][6 if holder == "left" else 13])
+            if self.config["strategy"] != "recovery_pulse" or self.grip is None:
+                self.grip = float(frame["proprio"][6 if holder == "left" else 13])
         if step - self.started >= self.config.get("max_intervention_steps", 180):
             return None, {**meta, "reason": "intervention_limit"}
         # A correction ends on an observable state, rather than requiring the
