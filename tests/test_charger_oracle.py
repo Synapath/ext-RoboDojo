@@ -88,3 +88,45 @@ def test_recovery_refuses_unsupported_grasp(kind):
                                  {"bilateral_contacts": contacts}, None)
     assert action is None and not meta["bc_eligible"]
     assert "actor_prefix_steps" not in meta
+
+
+def test_consecutive_corrections_use_new_frames_and_ignore_failed_proposals():
+    oracle = ChargerOracle(None, dict(strategy="recovery_pulse", actor_prefix_steps=2,
+                                      oracle_chunks_per_pulse=2))
+    oracle._relative_object_pose = lambda frame, holder: np.eye(4)
+    observed = []
+
+    def correct(frame, gate, proposal):
+        observed.append(frame["step"])
+        command = None if frame["step"] == 22 else np.zeros((10, 14))
+        return command, dict(reason="ik_failed" if command is None else "align")
+
+    oracle._correction = correct
+
+    def query(step, gate=None):
+        return oracle.propose(dict(step=step, proprio=np.zeros(14)),
+                              {"holding_proxy": "L"} if gate is None else gate, None)
+
+    assert query(20)[1]["reason"] == "actor_pulse"
+    assert query(22)[1]["reason"] == "ik_failed"
+    assert query(32)[0] is not None
+    assert query(42)[0] is not None
+    assert query(52)[1]["reason"] == "actor_pulse"
+    assert observed == [22, 32, 42]
+    # A new pulse resets the count. Recovery may extend the teacher period,
+    # but must not return control until the stable proxy is present.
+    assert query(54)[0] is not None
+    assert query(64)[0] is not None
+    assert query(74, {"bilateral_contacts": {"L": True}})[0] is not None
+    assert query(84)[1]["reason"] == "actor_pulse"
+    oracle.finishing = "home"
+    assert query(86)[0] is not None
+    assert query(96)[0] is not None
+    assert query(106)[0] is not None
+
+
+@pytest.mark.parametrize("period", [0, -1, True, 2.5, "2"])
+def test_invalid_correction_period_is_rejected(period):
+    with pytest.raises(ValueError, match="oracle_chunks_per_pulse"):
+        ChargerOracle(None, dict(strategy="recovery_pulse", actor_prefix_steps=2,
+                                 oracle_chunks_per_pulse=period))

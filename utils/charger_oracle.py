@@ -54,6 +54,9 @@ class ChargerOracle:
             n = config.get("actor_prefix_steps")
             if type(n) is not int or not 1 <= n < 10:
                 raise ValueError("actor_prefix_steps must be an integer in [1, 9]")
+            period = config.get("oracle_chunks_per_pulse", 1)
+            if type(period) is not int or period < 1:
+                raise ValueError("oracle_chunks_per_pulse must be a positive integer")
             for key, default in (("recovery_shift_m", 0.01), ("recovery_rotation_deg", 10),
                                  ("recovery_steps", 10)):
                 value = config.get(key, default)
@@ -68,6 +71,7 @@ class ChargerOracle:
         self.settled_chunks = 0
         self.completed = False
         self.pulse_due = True
+        self.oracle_chunks_since_pulse = 0
         self.hold_anchor = None
         self.hold_step = None
         self.pulse_stop_reason = None
@@ -141,6 +145,7 @@ class ChargerOracle:
             # keeps correcting until the ordinary holding proxy is stable again.
             if self.pulse_due and gate_row.get("holding_proxy") and not gate_row.get("native_insertion_three"):
                 self.pulse_due = False
+                self.oracle_chunks_since_pulse = 0
                 return None, {**meta, **detail, "reason": "actor_pulse",
                               "actor_prefix_steps": self.config["actor_prefix_steps"]}
             gate_row = recovered
@@ -148,7 +153,8 @@ class ChargerOracle:
             detail = {"holder_mode": "finishing"}
         command, info = self._correction(frame, gate_row, actor_proposal)
         if command is not None:
-            self.pulse_due = True
+            self.oracle_chunks_since_pulse += 1
+            self.pulse_due = self.oracle_chunks_since_pulse >= self.config.get("oracle_chunks_per_pulse", 1)
         return command, {**info, **detail}
 
     def _correction(self, frame, gate_row, actor_proposal):
