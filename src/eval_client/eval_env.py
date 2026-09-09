@@ -19,6 +19,7 @@ from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
 from utils.performance import profiled
 from utils.episode_telemetry import EpisodeTelemetry
+from utils.charger_diagnostics import ChargerDiagnostics, ContactObserver
 from utils.policy_execution import execution_client
 
 
@@ -129,6 +130,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.success = [True] * self.num_envs
             self.end_flag = [False] * self.num_envs
             self.take_action_cnt = [0] * self.num_envs
+            self.rlt_observations = {}
+            self.rlt_applied_actions = {}
             # Per-env streaming video writers: {env_idx: {camera_key: writer}}.
             # Replaces the old full-episode frame cache; only vision frames are
             # streamed to disk as they arrive instead of buffered in RAM.
@@ -136,6 +139,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.telemetry_enabled = bool(os.environ.get("SIM_SERVICE_SESSION_ID"))
             self.telemetry = {}
             self.telemetry_actions = {}
+            self.charger_diagnostics_enabled = (
+                os.environ.get("ROBODOJO_CHARGER_DIAGNOSTICS") == "1"
+                and self.task_name == "plug_in_charger"
+            )
+            self.charger_diagnostics = {}
+            self.rlt_observations = {}
+            self.rlt_applied_actions = {}
+            self.charger_contact_observer = None
             self.episode_nums = self.num_envs
             self.unstable_nums = 0
             self.unstable_envs: set[int] = set()
@@ -220,8 +231,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self._bind_observations_after_reset = self.sim is not None
 
         def close(self):
+            observer = getattr(self, "charger_contact_observer", None)
+            if observer is not None:
+                observer.close()
+                self.charger_contact_observer = None
             getattr(self, "telemetry", {}).clear()
             getattr(self, "telemetry_actions", {}).clear()
+            getattr(self, "charger_diagnostics", {}).clear()
             if os.environ.get("SIM_SERVICE_SESSION_ID"):
                 # Interrupted service jobs retain partial videos as evidence.
                 for writers in self.video_writers.values():
@@ -253,24 +269,55 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.success = [True] * self.num_envs
             self.end_flag = [False] * self.num_envs
             self.take_action_cnt = [0] * self.num_envs
+            self.rlt_observations = {}
+            self.rlt_applied_actions = {}
             # Discard any writers left open by a previous (e.g. crashed or
             # unstable) batch before starting a fresh one.
             self._abort_video_writers()
+            self.charger_diagnostics.clear()
+            if self.charger_contact_observer is not None:
+                self.charger_contact_observer.close()
+                self.charger_contact_observer = None
             self.episode_nums = len(real_indices)
             self.unstable_envs = set()
 
             self.current_env_seed_map = {}
             for idx in range(self.num_envs):
-                self.scene_manager.layout_manager.set_saved_layout(
-                    idx, self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
-                )
+                layout = self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
+                raw_xy = os.environ.get("ROBODOJO_CHARGER_SOCKET_XY")
+                if raw_xy is not None:
+                    from pathlib import Path
+                    from utils.charger_intervention import shifted_socket_layout
+
+                    info = dict(part.split("=", 1) for part in self.additional_info.split(",") if "=" in part)
+                    layout, receipt = shifted_socket_layout(
+                        layout, raw_xy, task=self.task_name,
+                        checkpoint=info.get("ckpt_name", ""), diagnostics=self.charger_diagnostics_enabled,
+                    )
+                    receipt.update(layout_id=int(self.env_seeds[idx]), env_idx=idx, seed=self.eval_seed)
+                    target = Path(self.save_dir) / f"intervention-layout-{self.env_seeds[idx]}-env-{idx}.json"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(json.dumps(receipt, indent=2, allow_nan=False) + "\n")
+                self.scene_manager.layout_manager.set_saved_layout(idx, layout)
                 if seed[idx] is None:
                     self.success[idx] = False
                     self.end_flag[idx] = True
                 else:
                     self.current_env_seed_map[idx] = seed[idx]
 
-            super().reset(seed=self.env_seeds, options=options)
+            setup_key = "ROBODOJO_CHARGER_CONTACT_ASSET_SETUP"
+            previous_setup = os.environ.get(setup_key)
+            try:
+                if self.charger_diagnostics_enabled and os.environ.get("ROBODOJO_CHARGER_CONTACTS") == "1":
+                    os.environ[setup_key] = "1"
+                else:
+                    os.environ.pop(setup_key, None)
+                super().reset(seed=self.env_seeds, options=options)
+            finally:
+                if previous_setup is None:
+                    os.environ.pop(setup_key, None)
+                else:
+                    os.environ[setup_key] = previous_setup
             if self._bind_observations_after_reset:
                 self.obs_manager.initialize(self)
                 self._bind_observations_after_reset = False
@@ -281,6 +328,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.reward_manager.init_state()
 
             self.model_client.call(func_name="reset")
+            if self.charger_diagnostics_enabled and os.environ.get("ROBODOJO_CHARGER_CONTACTS") == "1":
+                self.charger_contact_observer = ContactObserver(self)
 
         def setup_scene(self):
             self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
@@ -324,6 +373,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             for env_idx in env_idx_list:
                 if not self.end_flag[env_idx] or last_frame:
                     frames = self._stream_vision(env_idx, data[env_idx])
+                    if self.charger_diagnostics_enabled:
+                        if env_idx not in self.charger_diagnostics:
+                            self.charger_diagnostics[env_idx] = ChargerDiagnostics(self.sim.physics_dt)
+                        self.charger_diagnostics[env_idx].append(
+                            self, env_idx, int(self.sim._sim_step_counter), int(self.take_action_cnt[env_idx]),
+                            observation=data[env_idx] if os.environ.get("ROBODOJO_CHARGER_DIAGNOSTICS_VERIFY") == "1" else None,
+                        )
                     if self.telemetry_enabled:
                         if env_idx not in self.telemetry:
                             names = {
@@ -339,6 +395,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         )
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
+                if os.environ.get("ROBODOJO_RLT_INTERACTION") == "1":
+                    self.rlt_observations[env_idx] = (int(self.take_action_cnt[env_idx]), deepcopy(env_data))
                 data_list.append(env_data)
             return data_list
 
@@ -508,6 +566,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                             }
                         else:
                             pass
+                if os.environ.get("ROBODOJO_RLT_INTERACTION") == "1":
+                    applied = deepcopy(action)
+                    for robot in self.robot_manager.robot_list:
+                        if robot.type == "target" and robot.ee_type == "gripper":
+                            key = self.robot_manager.process_name(robot.gripper_name)
+                            applied[key] = [float(np.clip(applied[key][0], 0, 1))]
+                    self.rlt_applied_actions[env_idx] = applied
                 control_seq = self.process_control_info(control_info, env_idx)
                 control_info_list.append(control_seq)
 
@@ -887,6 +952,18 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     )
                 video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
                 videos = self.save_video(env_idx, video_path, tag)
+                diagnostics = self.charger_diagnostics.pop(env_idx, None)
+                if diagnostics is not None:
+                    try:
+                        diagnostics.save(
+                            os.path.join(self.save_dir, f"episode_{index:07d}.charger-diagnostics.json"),
+                            {"task": self.task_name, "env_config": self.config_name, "seed": int(self.eval_seed),
+                             "episode": int(index), "layout_id": int(self.env_seeds[env_idx])},
+                            success=bool(self.success[env_idx]), action_count=int(self.take_action_cnt[env_idx]),
+                            step_limit=int(self.step_lim),
+                        )
+                    except Exception as exc:
+                        print(f"CHARGER_DIAGNOSTICS_SAVE_ERROR episode={index}: {type(exc).__name__}: {exc}", flush=True)
                 telemetry = self.telemetry.pop(env_idx, None)
                 if telemetry is not None:
                     telemetry.save(
@@ -900,6 +977,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self._abort_video_writers()
             self.telemetry.clear()
             self.telemetry_actions.clear()
+            self.charger_diagnostics.clear()
 
             fail = self.episode_nums - success
             self.success_nums += success

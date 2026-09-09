@@ -1,4 +1,5 @@
 import random
+import os
 
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.prims import SingleGeometryPrim, SingleRigidPrim
@@ -98,6 +99,15 @@ class RigidObject(SingleRigidPrim, SingleGeometryPrim):
         self._default_angular_velocity = [0.0, 0.0, 0.0]
 
         self._setup_physics()
+        if (
+            os.environ.get("ROBODOJO_CHARGER_CONTACT_ASSET_SETUP") == "1"
+            and self.category_name == "charger"
+        ):
+            # Contact reporting must exist before the rigid actor is initialized.
+            from pxr import PhysxSchema
+
+            reporter = PhysxSchema.PhysxContactReportAPI.Apply(self.stage.GetPrimAtPath(self.prim_path))
+            reporter.CreateThresholdAttr().Set(0.0)
 
     def _get_object_transform(self, device=None):
         """
