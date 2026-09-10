@@ -24,7 +24,7 @@ def read_frame(env):
         cached = env.rlt_observations[0]
     diag = env.charger_diagnostics.get(0)
     if diag is None or diag.status != "complete" or not diag.rows or diag.rows[-1]["action_count"] != count:
-        raise RuntimeError("current diagnostic observation missing or invalid")
+        raise RuntimeError(f"current diagnostic observation missing or invalid: status={getattr(diag, 'status', None)}, errors={getattr(diag, 'errors', None)}")
     row = deepcopy(diag.rows[-1])
     ended = bool(env.end_flag[0])
     success = ended and bool(env.success[0])
