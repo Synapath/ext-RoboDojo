@@ -20,6 +20,7 @@ from utils.save_file import VideoStreamWriter, format_video_saved_message, save_
 from utils.performance import profiled
 from utils.episode_telemetry import EpisodeTelemetry
 from utils.charger_diagnostics import ChargerDiagnostics, ContactObserver
+from utils.tubes_diagnostics import TubesDiagnostics
 from utils.policy_execution import execution_client
 
 
@@ -144,6 +145,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 and self.task_name == "plug_in_charger"
             )
             self.charger_diagnostics = {}
+            self.tubes_diagnostics_enabled = self.task_name == "insert_tubes" and os.environ.get("ROBODOJO_TUBES_DIAGNOSTICS") == "1"
+            self.tubes_diagnostics = {}
             self.rlt_observations = {}
             self.rlt_applied_actions = {}
             self.charger_contact_observer = None
@@ -275,6 +278,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             # unstable) batch before starting a fresh one.
             self._abort_video_writers()
             self.charger_diagnostics.clear()
+            self.tubes_diagnostics.clear()
             if self.charger_contact_observer is not None:
                 self.charger_contact_observer.close()
                 self.charger_contact_observer = None
@@ -393,6 +397,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                             self.robot_manager.control_manager.prev_control[env_idx],
                             self.telemetry_actions.get(env_idx, {}), frames,
                         )
+                    if self.tubes_diagnostics_enabled:
+                        self.tubes_diagnostics.setdefault(env_idx, TubesDiagnostics()).append(self, env_idx)
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
                 if os.environ.get("ROBODOJO_RLT_INTERACTION") == "1":
@@ -953,6 +959,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
                 videos = self.save_video(env_idx, video_path, tag)
                 diagnostics = self.charger_diagnostics.pop(env_idx, None)
+                tubes = self.tubes_diagnostics.pop(env_idx, None)
+                if tubes is not None:
+                    tubes.append(self, env_idx)  # Include the terminal state even without another policy observation.
+                    tubes.save(
+                        os.path.join(self.save_dir, f"episode_{index:07d}.tubes-diagnostics.json"),
+                        {"task": self.task_name, "seed": int(self.eval_seed), "layout_id": int(self.env_seeds[env_idx])},
+                        success=self.success[env_idx], action_count=self.take_action_cnt[env_idx], step_limit=self.step_lim,
+                    )
                 if diagnostics is not None:
                     try:
                         diagnostics.save(
