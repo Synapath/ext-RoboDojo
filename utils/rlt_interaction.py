@@ -7,8 +7,11 @@ def enabled(env):
     import os
 
     active = os.environ.get("ROBODOJO_RLT_INTERACTION") == "1"
-    if active and (env.task_name != "plug_in_charger" or env.num_envs != 1 or not env.charger_diagnostics_enabled):
-        raise ValueError("RLT requires charger, one environment and diagnostics")
+    if active:
+        diagnostic = (getattr(env, "charger_diagnostics_enabled", False) if env.task_name == "plug_in_charger"
+                      else getattr(env, "tubes_diagnostics_enabled", False) if env.task_name == "insert_tubes" else False)
+        if env.num_envs != 1 or not diagnostic:
+            raise ValueError("RLT requires a supported task, one environment and diagnostics")
     return active
 
 
@@ -22,10 +25,15 @@ def read_frame(env):
             raise RuntimeError("native endpoint observation missing")
         env.get_obs_batch([0])
         cached = env.rlt_observations[0]
-    diag = env.charger_diagnostics.get(0)
-    if diag is None or diag.status != "complete" or not diag.rows or diag.rows[-1]["action_count"] != count:
-        raise RuntimeError(f"current diagnostic observation missing or invalid: status={getattr(diag, 'status', None)}, errors={getattr(diag, 'errors', None)}")
-    row = deepcopy(diag.rows[-1])
+    if env.task_name == "insert_tubes":
+        from utils.tubes_diagnostics import snapshot
+        row = snapshot(env, 0)
+        row["time_seconds"] = count / 25.0
+    else:
+        diag = env.charger_diagnostics.get(0)
+        if diag is None or diag.status != "complete" or not diag.rows or diag.rows[-1]["action_count"] != count:
+            raise RuntimeError("current charger diagnostic observation missing or invalid")
+        row = deepcopy(diag.rows[-1])
     ended = bool(env.end_flag[0])
     success = ended and bool(env.success[0])
     timeout = ended and not success and count >= env.step_lim

@@ -29,8 +29,8 @@ def _clone(value, device="cpu"):
 def _validate(env):
     from utils.rlt_interaction import enabled
 
-    if not enabled(env) or env.task_name != "plug_in_charger" or env.num_envs != 1:
-        raise ValueError("single charger RLT diagnostic required")
+    if not enabled(env) or env.task_name not in {"plug_in_charger", "insert_tubes"} or env.num_envs != 1:
+        raise ValueError("single supported RLT diagnostic required")
     if any(not q.is_empty() for q in env.robot_manager.control_manager.control_queue):
         raise ValueError("capture/restore requires an empty control queue")
     for name in ("_articulation_objects", "_garment_objects", "_fluid_objects"):
@@ -51,13 +51,13 @@ def _physical(env):
     )
 
 
-def capture(env, gate):
+def capture(env, gate=None):
     _validate(env)
-    if env.end_flag[0] or len(gate.rows) != env.take_action_cnt[0] + 1:
+    if env.end_flag[0] or (gate is not None and len(gate.rows) != env.take_action_cnt[0] + 1):
         raise ValueError("live handoff and complete gate history required")
     reward = env.reward_manager
     return dict(
-        schema="charger-exposed-state-v1", task=env.task_name,
+        schema="charger-exposed-state-v1" if env.task_name == "plug_in_charger" else "tubes-exposed-state-v1", task=env.task_name,
         layout=int(env.env_seeds[0]), seed=int(env.eval_seed), step_limit=int(env.step_lim),
         physical=_physical(env),
         env=_clone({k: getattr(env, k) for k in
@@ -71,8 +71,8 @@ def capture(env, gate):
         robot_origins=_clone([r.base_link_origin_pose for r in env.robot_manager.robot_list]),
         prev_control=_clone(env.robot_manager.control_manager.prev_control),
         instruction=_clone(env.obs_manager.instruction),
-        diagnostics=copy.deepcopy(env.charger_diagnostics),
-        gate=dict(rows=copy.deepcopy(gate.rows), ee=copy.deepcopy(gate.ee)),
+        diagnostics=copy.deepcopy(env.charger_diagnostics if env.task_name == "plug_in_charger" else env.tubes_diagnostics),
+        gate=dict(rows=copy.deepcopy(gate.rows), ee=copy.deepcopy(gate.ee)) if gate is not None else None,
         random=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
         cuda=torch.cuda.get_rng_state_all(),
     )
@@ -91,12 +91,12 @@ def load(path, sha256):
     if len(sha256) != 64 or hashlib.sha256(data).hexdigest() != sha256:
         raise ValueError("state hash mismatch")
     state = pickle.loads(data)
-    if state["schema"] != "charger-exposed-state-v1":
+    if state["schema"] not in {"charger-exposed-state-v1", "tubes-exposed-state-v1"}:
         raise ValueError("state schema")
     return state
 
 
-def restore(env, state, gate):
+def restore(env, state, gate=None):
     _validate(env)
     if (state["task"], state["layout"], state["seed"], state["step_limit"]) != (
             env.task_name, int(env.env_seeds[0]), int(env.eval_seed), env.step_lim):
@@ -130,16 +130,20 @@ def restore(env, state, gate):
         robot.base_link_origin_pose = _clone(origin, env.sim.device)
     env.robot_manager.control_manager.prev_control = _clone(state["prev_control"])
     env.obs_manager.instruction = _clone(state["instruction"])
-    env.charger_diagnostics = copy.deepcopy(state["diagnostics"])
+    if env.task_name == "plug_in_charger":
+        env.charger_diagnostics = copy.deepcopy(state["diagnostics"])
+    else:
+        env.tubes_diagnostics = copy.deepcopy(state["diagnostics"])
     env.rlt_observations = {}
-    if env.charger_contact_observer is not None:
+    if getattr(env, "charger_contact_observer", None) is not None:
         from utils.charger_diagnostics import ContactWindow
 
         env.charger_contact_observer.windows = {0: ContactWindow()}
     # Keep measured prefix history; Driver observes the restored current frame itself.
-    gate.rows = copy.deepcopy(state["gate"]["rows"][:-1])
-    gate.ee = {k: copy.deepcopy(v[:-1]) for k, v in state["gate"]["ee"].items()}
-    gate.last = None
+    if gate is not None:
+        gate.rows = copy.deepcopy(state["gate"]["rows"][:-1])
+        gate.ee = {k: copy.deepcopy(v[:-1]) for k, v in state["gate"]["ee"].items()}
+        gate.last = None
     random.setstate(state["random"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])
