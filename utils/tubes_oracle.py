@@ -87,7 +87,7 @@ class TubesOracle:
         self.object_to_ee = np.linalg.inv(obj) @ ee
         hole = g["objects"]["slot"]["holes"][config["hole"]]
         self.hole = np.asarray(hole["position"])
-        self.axis = np.asarray(hole["axis"])
+        self.axis = np.asarray(hole["axis"], dtype=float)
         self.axis /= np.linalg.norm(self.axis)
         # Rotate current tube Y onto hole Z with the smallest orientation change.
         v = obj[:3, 1]
@@ -101,6 +101,16 @@ class TubesOracle:
         self.release_q = None
         self.lift_start = None
         self.joint_target = self.standby[self.offset : self.offset + 6].copy()
+        self.stable_contact = bool(config.get("stable_contact", False))
+        if self.stable_contact and (config.get("solver") != "jacobian" or not config.get("integral_servo", False)):
+            raise ValueError("stable_contact requires the Jacobian integral servo")
+        self.contact = False
+        self.confirm_steps = 0
+        self.last_increment = np.zeros(6)
+        self.release_command = self.grip
+        self.previous_object = obj.copy()
+        self.release_streak = 0
+        self.seating_streak = 0
 
     def propose(self, q, g, predicates):
         q = np.asarray(q, dtype=float)
@@ -110,6 +120,24 @@ class TubesOracle:
         lateral = np.linalg.norm((obj[:3, 3] - self.hole) - self.axis * np.dot(obj[:3, 3] - self.hole, self.axis))
         tilt = np.rad2deg(np.arccos(np.clip(np.dot(obj[:3, 1], self.axis), -1, 1)))
         self.stage_steps += 1
+        quiet = np.linalg.norm(obj[:3, 3] - self.previous_object[:3, 3]) < self.config.get(
+            "settle_translation_m", 0.001
+        ) and Rotation.from_matrix(obj[:3, :3] @ self.previous_object[:3, :3].T).magnitude() < np.deg2rad(1)
+        self.previous_object = obj.copy()
+        self.release_streak = (
+            self.release_streak + 1
+            if (
+                self.phase == "release"
+                and quiet
+                and all(predicates[self.tube].values())
+                and self.release_command >= 1.0
+            )
+            else 0
+        )
+        if self.stable_contact:
+            self.contact = bool(
+                self.contact or (self.phase == "insert" and np.dot(obj[:3, 3] - self.hole, self.axis) < 0.002)
+            )
         if (
             self.phase == "align-above"
             and lateral < self.config.get("alignment_m", 0.002)
@@ -118,29 +146,84 @@ class TubesOracle:
         ):
             self.phase = "insert"
             self.stage_steps = 0
-        if self.phase == "insert" and all(predicates[self.tube].values()) and tilt < 3:
+        inserted = all(predicates[self.tube].values()) and tilt < 3
+        self.confirm_steps = self.confirm_steps + 1 if self.phase in ["insert", "seat"] and inserted else 0
+        required = self.config.get("insert_confirm_steps", 5) if self.stable_contact else 1
+        seat_depth = self.config.get("guided_seat_depth_m", 0.035)
+        supported = (
+            self.stable_contact
+            and seat_depth is not None
+            and self.phase == "insert"
+            and np.dot(self.hole - obj[:3, 3], self.axis) >= seat_depth
+            and predicates[self.tube]["inside"]
+            and predicates[self.tube]["upright"]
+            and lateral < 0.0006
+            and tilt < 0.8
+        )
+        self.seating_streak = self.seating_streak + 1 if supported else 0
+        if self.seating_streak >= 5:
+            self.phase = "seat"
+            self.stage_steps = 0
+        if self.phase in ["insert", "seat"] and self.confirm_steps >= required:
             self.phase = "release"
             self.stage_steps = 0
             self.release_q = q.copy()
-        if self.phase == "release" and self.stage_steps >= 10:
+            if self.stable_contact:
+                self.release_q[off : off + 6] = self.joint_target
+                self.release_command = self.grip
+        release_steps = self.config.get("release_steps", 25) if self.stable_contact else 10
+        release_ready = not self.stable_contact or self.release_streak >= self.config.get("release_confirm_steps", 5)
+        if self.phase == "release" and self.stage_steps >= release_steps and release_ready:
             self.phase = "lift"
             self.stage_steps = 0
             self.lift_start = ee.copy()
             self.joint_target = q[off : off + 6].copy()
+            self.last_increment = np.zeros(6)
         desired = ee.copy()
         goal = self.standby.copy()
         if self.phase in ["align-above", "insert"]:
             target = obj.copy()
             target[:3, :3] = self.rotation
+            if self.stable_contact and self.contact:
+                # A tube is axially symmetric: preserve its current axial spin.
+                # Do not chase grasp-induced yaw or sub-degree contact motion.
+                cross = np.cross(obj[:3, 1], self.axis)
+                norm = np.linalg.norm(cross)
+                angle = np.arctan2(norm, np.dot(obj[:3, 1], self.axis))
+                correction = max(0.0, angle - np.deg2rad(self.config.get("contact_tilt_deadband_deg", 0.3)))
+                target[:3, :3] = Rotation.from_rotvec(cross / max(norm, 1e-9) * correction).as_matrix() @ obj[:3, :3]
             target[:3, 3] = self.hole + self.axis * (0.03 if self.phase == "align-above" else -0.05)
             # Refresh the measured grasp transform: a frozen transform leaves a
             # persistent object error after any small slip during alignment.
             desired = target @ np.linalg.inv(obj) @ ee
             goal[off + 6] = self.grip
+        elif self.phase == "seat":
+            acceleration = self.config.get("joint_acceleration", 0.001)
+            self.last_increment += np.clip(-self.last_increment, -acceleration, acceleration)
+            self.joint_target += self.last_increment
+            goal[off : off + 6] = self.joint_target
+            self.grip = min(
+                self.config.get("seat_gripper_max", 0.45), self.grip + self.config.get("seat_gripper_step", 0.0025)
+            )
+            goal[off + 6] = self.grip
+            return goal, dict(
+                phase=self.phase,
+                lateral_m=float(lateral),
+                tilt_deg=float(tilt),
+                contact_mode=self.contact,
+                insert_confirm_steps=self.confirm_steps,
+            )
         elif self.phase == "release":
             goal[off : off + 6] = self.release_q[off : off + 6]
-            goal[off + 6] = 1
-            return goal, dict(phase=self.phase, lateral_m=float(lateral), tilt_deg=float(tilt))
+            self.release_command = min(1.0, self.release_command + self.config.get("gripper_step", 0.015))
+            goal[off + 6] = self.release_command if self.stable_contact else 1
+            return goal, dict(
+                phase=self.phase,
+                lateral_m=float(lateral),
+                tilt_deg=float(tilt),
+                contact_mode=self.contact,
+                release_confirm_steps=self.release_streak,
+            )
         else:
             desired = self.lift_start.copy()
             desired[:3, 3] += self.axis * 0.22
@@ -174,14 +257,44 @@ class TubesOracle:
             offset = cpu_array(articulation.data.body_link_pos_w[0, body] - articulation.data.body_com_pos_w[0, body])
             jac[:3] += np.cross(jac[3:].T, offset).T
             error = np.r_[desired[:3, 3] - ee[:3, 3], Rotation.from_matrix(desired[:3, :3] @ ee[:3, :3].T).as_rotvec()]
-            delta = jac.T @ np.linalg.solve(jac @ jac.T + np.eye(6) * 0.002**2, error)
+            damping = self.config.get("contact_damping", 0.002) if self.stable_contact and self.contact else 0.002
+            delta = jac.T @ np.linalg.solve(jac @ jac.T + np.eye(6) * damping**2, error)
+            if self.stable_contact and self.phase == "insert" and inserted:
+                # Seat confirmation holds the current command through a bounded
+                # deceleration; a single positive frame does not trigger release.
+                delta = np.zeros_like(delta)
             if self.config.get("integral_servo", False):
-                self.joint_target += np.clip(delta * 0.5, -0.02, 0.02)
-                self.joint_target = np.clip(self.joint_target, q[off : off + 6] - 0.07, q[off : off + 6] + 0.07)
+                if self.stable_contact and self.contact:
+                    limit = self.config.get("contact_joint_step", 0.004)
+                    if self.phase == "lift":
+                        limit = self.config.get("lift_joint_step", 0.008)
+                    acceleration = self.config.get("joint_acceleration", 0.001)
+                    increment = np.clip(delta * 0.5, -limit, limit)
+                    increment = np.clip(
+                        increment, self.last_increment - acceleration, self.last_increment + acceleration
+                    )
+                    # Retain the tracking-error guard. At this hard bound it
+                    # takes precedence over the nominal acceleration limit.
+                    candidate = self.joint_target + increment
+                    bounded = np.clip(candidate, q[off : off + 6] - 0.07, q[off : off + 6] + 0.07)
+                    self.last_increment = bounded - self.joint_target
+                    self.joint_target = bounded
+                else:
+                    previous_target = self.joint_target.copy()
+                    self.joint_target += np.clip(delta * 0.5, -0.02, 0.02)
+                    self.joint_target = np.clip(self.joint_target, q[off : off + 6] - 0.07, q[off : off + 6] + 0.07)
+                    self.last_increment = self.joint_target - previous_target
                 goal[off : off + 6] = self.joint_target
             else:
                 goal[off : off + 6] = q[off : off + 6] + np.clip(delta, -0.035, 0.035)
-            return goal, dict(phase=self.phase, lateral_m=float(lateral), tilt_deg=float(tilt), solver="jacobian")
+            return goal, dict(
+                phase=self.phase,
+                lateral_m=float(lateral),
+                tilt_deg=float(tilt),
+                solver="jacobian",
+                contact_mode=self.contact,
+                insert_confirm_steps=self.confirm_steps,
+            )
         solution = self.env.robot_manager.solve_ik(pose.tolist(), 0, robot, trans="world")
         if solution["status"] != "Success":
             raise RuntimeError("tubes Oracle IK failed")
