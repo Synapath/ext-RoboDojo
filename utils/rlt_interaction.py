@@ -43,6 +43,7 @@ def read_frame(env):
         "time_s": row["time_seconds"],
         "observation": deepcopy(cached[1]),
         "native_success": success,
+        "native_score": float(env.reward_manager.get_score()[0]) if hasattr(env, 'get_score') else None,
         "time_limit": timeout,
         "error": error,
         "diagnostics": row,
