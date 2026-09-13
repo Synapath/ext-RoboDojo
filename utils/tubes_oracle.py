@@ -32,15 +32,19 @@ def geometry(env):
     return dict(objects=objects, hands=hands)
 
 
-def choose_handoff(g, q, predicates, history):
+def choose_handoff(g, q, predicates, history, *, tube_id=None, arm=None):
     """Lift + stable hand/object relative pose; this is a geometric holding proxy."""
     if any(all(p.values()) for p in predicates):
         return None
     candidates = []
     for i in range(3):
+        if tube_id is not None and i != tube_id:
+            continue
         obj = pose_matrix(g["objects"][f"tube{i}"]["pose"])
         center = obj[:3, 3] + obj[:3, 1] * 0.07
         for side, off in [("left", 0), ("right", 7)]:
+            if arm is not None and side != arm:
+                continue
             ee = pose_matrix(g["hands"][side])
             rel = np.linalg.inv(ee) @ obj
             key = f"{i}-{side}"
