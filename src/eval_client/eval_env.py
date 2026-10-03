@@ -53,6 +53,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def __init__(self, config, app, resume_state=None, **kwargs):
             super().__init__(config, app, **kwargs)
             self.eval_cfg = config.eval_cfg
+            from utils.stack_bowls_diagnostics import metric_mode
+
+            self.stack_bowls_metric_mode = metric_mode(self.eval_cfg, resume_state)
+            self.stack_bowls_diagnostics = None
             self.config_name = self.eval_cfg.get("config_name", None)
             self.task_name = self.eval_cfg.get("task_name", None)
             self.eval_batch = self.eval_cfg.get("eval_batch", False)
@@ -197,6 +201,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
 
         def close(self):
+            if self.stack_bowls_diagnostics is not None:
+                self.stack_bowls_diagnostics.close()
             self._abort_video_writers()
             self.obs_manager.reset()
             super().close()
@@ -206,6 +212,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.obs_manager.initialize(self)
 
         def reset(self, seed=None, options=None):
+            if self.stack_bowls_diagnostics is not None:
+                self.stack_bowls_diagnostics.close()
+                self.stack_bowls_diagnostics = None
             seed = list(seed)
             if len(seed) < self.num_envs:
                 seed = seed + [None] * (self.num_envs - len(seed))
@@ -693,6 +702,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 "config_name": self.config_name,
                 "eval_seed": self.eval_seed,
                 "additional_info": self.additional_info,
+                "stack_bowls_metric": self.stack_bowls_metric_mode,
                 "success_nums": int(self.success_nums),
                 "fail_nums": int(self.fail_nums),
                 "unstable_nums": int(self.unstable_nums),
@@ -772,6 +782,16 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.run_reward()
             if hasattr(self, "get_score"):
                 self.get_score()
+            if self.stack_bowls_metric_mode != "off":
+                from utils.stack_bowls_diagnostics import VERSION, StackBowlsDiagnostics
+
+                self.stack_bowls_diagnostics = StackBowlsDiagnostics(
+                    self, self.stack_bowls_metric_mode, os.path.join(ROBOTS_PATH, "x5", "X5A.urdf")
+                )
+                self.eval_result["stack_bowls_metric"] = {
+                    "version": VERSION, "mode": self.stack_bowls_metric_mode,
+                    "native_scope": "shadow-on-dual-trajectory" if self.stack_bowls_metric_mode == "dual" else "native-trajectory",
+                }
             exist_envs = self.get_running_env_idx_list()
             if getattr(self, "interact", False):
                 if hasattr(self, "query_support_arm_traj"):
@@ -815,6 +835,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     "success": bool(self.success[env_idx]),
                     "score": episode_score,
                 }
+                if self.stack_bowls_diagnostics is not None:
+                    self.eval_result["details"][index]["stack_bowls"] = self.stack_bowls_diagnostics.save(
+                        env_idx, index, self.take_action_cnt[env_idx], self.step_lim
+                    )
                 video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
                 self.save_video(env_idx, video_path, tag)
 
@@ -822,6 +846,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self._abort_video_writers()
 
             fail = self.episode_nums - success
+            if self.stack_bowls_diagnostics is not None:
+                self.stack_bowls_diagnostics.close()
             self.success_nums += success
             self.fail_nums += fail
             eval_time = self.success_nums + self.fail_nums
@@ -851,6 +877,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             for env_idx in range(self.num_envs):
                 if self.end_flag[env_idx]:
                     continue
+                monitor = self.stack_bowls_diagnostics
+                if monitor is not None and env_idx not in self.unstable_envs:
+                    monitor.observe(self, env_idx, reward_list[env_idx] > 1 - 1e-3)
+                    if self.stack_bowls_metric_mode == "dual":
+                        if monitor.dual_done(env_idx, self.take_action_cnt[env_idx], self.step_lim, self.success[env_idx]):
+                            self.end_flag[env_idx] = True
+                            self.success[env_idx] = monitor.native[env_idx] is not None
+                        continue
                 if reward_list[env_idx] > 1 - 1e-3:
                     self.end_flag[env_idx] = True
                     self.success[env_idx] = True

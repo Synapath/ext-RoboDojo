@@ -1,0 +1,23 @@
+{
+  "schema": "stack-bowls-evidence-index-v1",
+  "metric_version": "stable-stack-v2",
+  "analysis_entrypoint": "scripts/analyze_stack_bowls.py",
+  "archive": {
+    "name": "review-bundle-v1.tar.gz",
+    "run_id": "x1-feasibility-20261003",
+    "sha256": "2c8b8dde858cbca1d2280e9be65bbe59fd51400c4b8edb1eed8a9563b0a6735b",
+    "bytes": 15095704,
+    "access": "existing project evidence storage; payload is not hosted in this public repository",
+    "content_manifest": "x1-feasibility-20261003/review-manifest.sha256"
+  },
+  "frozen_verifier_sha256": "e6441754b31668aea544cdb74844af19e885dc3e5c36178b2b93ee71c717a30d",
+  "promotion_validation": {
+    "scope": "55 complete baseline geometry traces and 4 selected closed-loop continuations",
+    "traces": 59,
+    "baseline_native_successes": 39,
+    "baseline_stable_successes": 46,
+    "first_pass_steps_match": true,
+    "receipt_sha256": "2bcbe8343d49b8558f7f71493875f4f8a2d21035a4cef51c4b54695491bedcff",
+    "scope_excludes": "new-runtime GPU smoke, service deployment, policy improvement claims"
+  }
+}
