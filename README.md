@@ -30,6 +30,10 @@ https://private-user-images.githubusercontent.com/88101805/619409345-cc074c5d-45
 
 ## 📚 Documentation
 
+Company-fork extension: [optional stable stacking diagnostics](docs/stack-bowls-metric.md)
+record released-and-stable bowls separately from native success (which includes arm return).
+The default benchmark behavior is unchanged; the extension includes a CPU trace-analysis tool.
+
 The [RoboDojo documentation](https://robodojo-benchmark.com/doc/) is the canonical reference. Key sections:
 
 | Section | Description |

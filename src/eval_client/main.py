@@ -59,6 +59,12 @@ parser.add_argument(
 
 
 parser.add_argument("--seed", type=int, required=True, help="policy seed for eval")
+parser.add_argument(
+    "--stack_bowls_metric",
+    choices=("off", "shadow", "dual"),
+    default="off",
+    help="Stable-stack-v2: shadow keeps native stopping; dual observes both endpoints up to 800 steps.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -261,6 +267,9 @@ def main():
     eval_cfg["eval_batch"] = eval_batch
     eval_cfg["policy_name"] = args_cli.policy_name
     eval_cfg["additional_info"] = args_cli.additional_info
+    eval_cfg["stack_bowls_metric"] = args_cli.stack_bowls_metric
+    if args_cli.stack_bowls_metric != "off":
+        eval_cfg["additional_info"] += f",stack_metric={args_cli.stack_bowls_metric}-v2"
     eval_cfg["seed"] = args_cli.seed
     eval_cfg["physx_monitor_enabled"] = enable_monitor
 
