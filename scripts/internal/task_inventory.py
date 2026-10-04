@@ -14,6 +14,9 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 BENCHMARK = "RoboDojo"
 TASK_DIR = ROOT_DIR / "task" / BENCHMARK / "tasks"
 CONFIG_DIR = ROOT_DIR / "task" / BENCHMARK / "config"
+POLICY_DIR = ROOT_DIR / "XPolicyLab" / "policy"
+ENV_CONFIG_DIR = ROOT_DIR / "env_cfg"
+SERVICE_SCHEMA = "robodojo-runtime-inventory-v1"
 
 sys.path.insert(0, str(ROOT_DIR))
 from task.RoboDojo import task_registry  # noqa: E402
@@ -182,6 +185,115 @@ def build_inventory() -> dict[str, Any]:
     return inventory
 
 
+def _load_yaml(path: Path) -> dict[str, Any]:
+    import yaml
+
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"YAML root must be an object: {path}")
+    return value
+
+
+def _function_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def build_service_inventory(env_configs: list[str]) -> dict[str, Any]:
+    """Pure filesystem inventory for sim-service startup; imports no simulator."""
+    task_index = _load_yaml(CONFIG_DIR / "_task.yml")
+    common = task_index.get("common")
+    overrides = task_index.get("tasks")
+    if not isinstance(common, dict) or not isinstance(overrides, dict):
+        raise ValueError("RoboDojo task index is invalid")
+    tasks = {}
+    for record in _task_records():
+        if not record["runnable"]:
+            raise ValueError(f"task class/config pair is incomplete: {record['name']}")
+        task_override = overrides.get(record["name"], {})
+        if not isinstance(task_override, dict):
+            raise ValueError(f"task override is invalid: {record['name']}")
+        native_eval_num = task_override.get("eval_nums", common.get("eval_nums"))
+        if type(native_eval_num) is not int or native_eval_num <= 0:
+            raise ValueError(f"task eval_nums is invalid: {record['name']}")
+        tasks[record["name"]] = {
+            "native_eval_num": native_eval_num,
+            "max_num_envs": None,
+        }
+
+    adapters = {}
+    if not POLICY_DIR.is_dir() or POLICY_DIR.is_symlink():
+        raise ValueError("XPolicyLab policy directory is unavailable")
+    for directory in sorted(POLICY_DIR.iterdir()):
+        if directory.name.startswith("."):
+            continue
+        if not directory.is_dir() and not directory.is_symlink():
+            continue
+        deploy_yml = directory / "deploy.yml"
+        deploy_py = directory / "deploy.py"
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError(f"policy adapter directory is invalid: {directory.name}")
+        if not deploy_yml.is_file() or deploy_yml.is_symlink():
+            continue
+        if not deploy_py.is_file() or deploy_py.is_symlink():
+            raise ValueError(f"policy adapter entrypoint is missing: {directory.name}")
+        deploy = _load_yaml(deploy_yml)
+        if deploy.get("policy_name") != directory.name:
+            raise ValueError(f"policy adapter name mismatch: {directory.name}")
+        eval_batch = deploy.get("eval_batch", False)
+        if type(eval_batch) is not bool:
+            raise ValueError(f"policy adapter eval_batch is invalid: {directory.name}")
+        functions = _function_names(deploy_py)
+        entrypoint = "batch" if eval_batch else "single"
+        required = "eval_one_episode_batch" if eval_batch else "eval_one_episode"
+        if required not in functions:
+            raise ValueError(f"policy adapter entrypoint is missing: {directory.name}")
+        adapters[directory.name] = {
+            "eval_batch": eval_batch,
+            "execution_horizon_required": directory.name == "Pi_05",
+            "entrypoint": entrypoint,
+        }
+    if not adapters:
+        raise ValueError("no policy adapters were discovered")
+
+    environments = {}
+    for name in env_configs:
+        if not name or Path(name).name != name:
+            raise ValueError(f"invalid env config name: {name}")
+        path = ENV_CONFIG_DIR / f"{name}.yml"
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"env config is missing: {name}")
+        value = _load_yaml(path)
+        config = value.get("config")
+        sim_name = config.get("sim") if isinstance(config, dict) else None
+        if not isinstance(sim_name, str) or not sim_name:
+            raise ValueError(f"env config sim declaration is invalid: {name}")
+        sim_path = ENV_CONFIG_DIR / "sim" / f"{sim_name}.yml"
+        sim = _load_yaml(sim_path)
+        scene = sim.get("scene")
+        num_envs = scene.get("num_envs") if isinstance(scene, dict) else None
+        if type(num_envs) is not int or num_envs <= 0:
+            raise ValueError(f"sim num_envs is invalid: {sim_name}")
+        random_task_num_envs = scene.get("clutter_env_limit", 5)
+        if type(random_task_num_envs) is not int or random_task_num_envs <= 0:
+            raise ValueError(f"sim clutter_env_limit is invalid: {sim_name}")
+        environments[name] = {
+            "num_envs": num_envs,
+            "random_task_num_envs": random_task_num_envs,
+            "sim_config": sim_name,
+        }
+    return {
+        "schema_version": SERVICE_SCHEMA,
+        "tasks": tasks,
+        "policy_adapters": adapters,
+        "env_configs": environments,
+    }
+
+
 def _print_plain(inventory: dict[str, Any], only_runnable: bool) -> None:
     for task in inventory["tasks"]:
         if only_runnable and not task["runnable"]:
@@ -278,12 +390,36 @@ def main() -> int:
         action="store_true",
         help="Exit non-zero if any task is missing its config or exported class.",
     )
+    parser.add_argument(
+        "--service-inventory",
+        action="store_true",
+        help="Emit the strict CPU-only sim-service runtime inventory JSON.",
+    )
+    parser.add_argument(
+        "--env-config",
+        action="append",
+        default=[],
+        help="Deployment env config to validate in --service-inventory mode.",
+    )
     args = parser.parse_args()
 
     try:
         selected_dimensions = _parse_dimensions(args.dimension)
     except ValueError as exc:
         parser.error(str(exc))
+
+    if args.service_inventory:
+        if not args.env_config:
+            parser.error("--service-inventory requires at least one --env-config")
+        try:
+            value = build_service_inventory(args.env_config)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(value, sort_keys=True))
+        return 0
+
+    if args.env_config:
+        parser.error("--env-config is only valid with --service-inventory")
 
     if args.resolve_dimensions:
         print(",".join(_normalized_dimension_names(selected_dimensions)))

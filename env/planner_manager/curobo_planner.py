@@ -104,16 +104,28 @@ class CuroboPlanner:
         if self.use_cuda_graph:
             self._prewarm_alternate_modes()
 
+    def close(self):
+        """Permanently release graphs AND their owning tensors/configs."""
+        if getattr(self, "_closed", False):
+            return
+        errors = []
+        for name in ("ik_solver", "motion_planner", "motion_planner_batch"):
+            resource = getattr(self, name, None)
+            if resource is not None:
+                try:
+                    resource.destroy()
+                except Exception as exc:
+                    errors.append(f"{name}: {type(exc).__name__}: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        self.__dict__.clear()
+        self._closed = True
+
     def __del__(self):
         try:
-            if hasattr(self, "ik_solver"):
-                self.ik_solver.destroy()
-            if hasattr(self, "motion_planner"):
-                self.motion_planner.destroy()
-            if hasattr(self, "motion_planner_batch"):
-                self.motion_planner_batch.destroy()
+            self.close()
         except Exception:
-            pass
+            pass  # explicit service close reports errors; destructor cannot
 
     def _build_cspace_joint_values(self, active_joint_values):
         active_joint_values = self._extract_active_joint_values(active_joint_values)
