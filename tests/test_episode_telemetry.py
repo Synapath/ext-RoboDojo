@@ -52,7 +52,8 @@ def test_eval_hooks_do_not_add_simulation_or_render_calls():
     functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
     observation = functions["get_obs_batch"]
     calls = [n.func.attr for n in ast.walk(observation) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
-    assert calls.count("get_obs") == 1 and calls.count("render") == 1
+    assert calls.count("get_obs") == 1 and calls.count("render_for_capture") == 1
+    assert calls.count("render") == 0
     assert "step" not in calls and "sim_step" not in calls
     close = ast.unparse(functions["close"])
     assert "'telemetry'" in close and "'telemetry_actions'" in close

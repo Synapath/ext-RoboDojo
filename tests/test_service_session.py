@@ -398,7 +398,8 @@ class ResidentContracts(unittest.TestCase):
             scene_manager=SimpleNamespace(apply_saved_poses=lambda **kw: events.append("layout"),
                 layout_manager=SimpleNamespace(check_layout_stability=lambda env: (True, []))),
             _align_layout_success=lambda: None, render=lambda: events.append("render"),
-            sim_step=lambda: events.append("physics"), obs_manager=SimpleNamespace(get_obs=lambda: events.append("obs")))
+            sim_step=lambda: events.append("physics"), obs_manager=SimpleNamespace(
+                render_for_capture=lambda: events.append("render"), get_obs=lambda: events.append("obs")))
         with patch.dict(os.environ, {"SIM_SERVICE_SESSION_ID": "a" * 32}), patch.dict(sys.modules, {"omni": omni, "omni.usd": usd}):
             setup(env)
         self.assertEqual(events[:3], ["layout", "history-reset", "render"])
