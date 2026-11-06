@@ -17,6 +17,9 @@ from env.seed_manager.seed_manager import SeedManager
 from utils.cluttered_generator import UnStableError
 from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
+from utils.performance import profiled
+from utils.episode_telemetry import EpisodeTelemetry
+from utils.policy_execution import execution_client
 
 
 def _patch_websockets_proxy_compat():
@@ -52,6 +55,18 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
     class EvalEnv(task_class):
         def __init__(self, config, app, resume_state=None, **kwargs):
             super().__init__(config, app, **kwargs)
+            self.configure_evaluation(config, resume_state)
+
+        def configure_evaluation(self, config, resume_state=None):
+            """Fresh job state, without reconstructing the task/Isaac environment."""
+            if getattr(self, "video_writers", None):
+                raise RuntimeError("Cannot reset a job with unfinished video writers")
+            previous_client = getattr(self, "model_client", None)
+            if previous_client is not None:
+                previous_client.close()
+            if config.sim.scene.num_envs != self.num_envs:
+                raise ValueError("Resident environment count cannot change")
+            self.env_seed_list = list(config.sim.seed)
             self.eval_cfg = config.eval_cfg
             self.config_name = self.eval_cfg.get("config_name", None)
             self.task_name = self.eval_cfg.get("task_name", None)
@@ -78,7 +93,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 os.environ["ROBODOJO_RUN_ID"] = run_id
             self.run_id = run_id
             self.save_dir = os.path.join(
-                "eval_result",
+                os.environ.get("ROBODOJO_OUTPUT_ROOT", "eval_result"),
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
@@ -118,6 +133,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             # Replaces the old full-episode frame cache; only vision frames are
             # streamed to disk as they arrive instead of buffered in RAM.
             self.video_writers: dict[int, dict[str, VideoStreamWriter]] = {}
+            self.telemetry_enabled = bool(os.environ.get("SIM_SERVICE_SESSION_ID"))
+            self.telemetry = {}
+            self.telemetry_actions = {}
             self.episode_nums = self.num_envs
             self.unstable_nums = 0
             self.unstable_envs: set[int] = set()
@@ -195,9 +213,23 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 ws_ping_timeout_s=self.deploy_cfg.get("ws_ping_timeout_s", 20.0),
             )
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
+            # Include transport, serialization and waiting, not just inference.
+            self.model_client.call = profiled("policy_rpc")(self.model_client.call)
+            # A reused simulator skips _post_setup_scene. Bind descriptions
+            # only after reset has loaded THIS job's layout, not the last one.
+            self._bind_observations_after_reset = self.sim is not None
 
         def close(self):
-            self._abort_video_writers()
+            getattr(self, "telemetry", {}).clear()
+            getattr(self, "telemetry_actions", {}).clear()
+            if os.environ.get("SIM_SERVICE_SESSION_ID"):
+                # Interrupted service jobs retain partial videos as evidence.
+                for writers in self.video_writers.values():
+                    for writer in writers.values():
+                        writer.close(announce=False)
+                self.video_writers.clear()
+            else:
+                self._abort_video_writers()
             self.obs_manager.reset()
             super().close()
 
@@ -206,6 +238,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.obs_manager.initialize(self)
 
         def reset(self, seed=None, options=None):
+            # Subsequent batches also reload layouts without _post_setup_scene.
+            # Rebind descriptions after each soft reset, not only a new job.
+            self._bind_observations_after_reset = self.sim is not None
             seed = list(seed)
             if len(seed) < self.num_envs:
                 seed = seed + [None] * (self.num_envs - len(seed))
@@ -236,6 +271,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     self.current_env_seed_map[idx] = seed[idx]
 
             super().reset(seed=self.env_seeds, options=options)
+            if self._bind_observations_after_reset:
+                self.obs_manager.initialize(self)
+                self._bind_observations_after_reset = False
             self.obs_manager.reset()  # Reset observation manager for the next episode
             self.setup_scene()
             self.robot_manager.set_origin_endpose()
@@ -253,6 +291,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.episode_nums -= len(unstable_envs)
             if not success or self.episode_nums <= 0:
                 raise UnStableError("All scene Unstable Error!")
+            if os.environ.get("SIM_SERVICE_SESSION_ID"):
+                import omni.usd
+                from utils.service_session import reset_renderer_history
+
+                reset_renderer_history(omni.usd.get_context())
+                self._renderer_history_reset = True
             for _ in range(10):
                 self.render()
             for idx in range(200):
@@ -266,6 +310,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def get_obs(self):
             return self.get_obs_batch(env_idx_list=[0])[0]
 
+        @profiled("observation")
         def get_obs_batch(self, env_idx_list=None, last_frame=False):
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
@@ -278,7 +323,20 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data_list = []
             for env_idx in env_idx_list:
                 if not self.end_flag[env_idx] or last_frame:
-                    self._stream_vision(env_idx, data[env_idx])
+                    frames = self._stream_vision(env_idx, data[env_idx])
+                    if self.telemetry_enabled:
+                        if env_idx not in self.telemetry:
+                            names = {
+                                f"{robot.arm_name}_joint_state": list(robot.arm_joints_name)
+                                for robot in self.robot_manager.robot_list
+                                if robot.type == "target" and robot.robot_type == "arm"
+                            }
+                            self.telemetry[env_idx] = EpisodeTelemetry(self.sim.physics_dt, names)
+                        self.telemetry[env_idx].append(
+                            int(self.sim._sim_step_counter), data[env_idx].get("state", {}),
+                            self.robot_manager.control_manager.prev_control[env_idx],
+                            self.telemetry_actions.get(env_idx, {}), frames,
+                        )
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
                 data_list.append(env_data)
@@ -307,7 +365,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 )
                 raise AttributeError("Missing eval_one_episode in policy module")
 
-            eval_module.eval_one_episode(TASK_ENV=self, model_client=self.model_client)
+            eval_module.eval_one_episode(
+                TASK_ENV=self, model_client=execution_client(policy_name, self.model_client)
+            )
 
         def eval_one_episode_batch(self):
             policy_name = self.deploy_cfg["policy_name"]
@@ -332,7 +392,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 )
                 raise AttributeError("Missing eval_one_episode_batch in policy module")
 
-            eval_module.eval_one_episode_batch(TASK_ENV=self, model_client=self.model_client)
+            eval_module.eval_one_episode_batch(
+                TASK_ENV=self, model_client=execution_client(policy_name, self.model_client)
+            )
 
         def get_action_type(self, action):
             action_type = []
@@ -355,6 +417,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.validate_action_dict(action)
             self.take_action_batch([action], env_idx_list=[0])
 
+        @profiled("action")
         def take_action_batch(self, actions_list, env_idx_list=None):
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
@@ -369,6 +432,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     continue
 
                 self.take_action_cnt[env_idx] += 1
+                if self.telemetry_enabled:
+                    self.telemetry_actions[env_idx] = deepcopy(action)
                 print(
                     f"env{env_idx} step: \033[92m{self.take_action_cnt[env_idx]} / {self.step_lim}\033[0m",
                     end="\r",
@@ -659,7 +724,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             locate by humans.
             """
             return os.path.join(
-                "eval_result",
+                os.environ.get("ROBODOJO_OUTPUT_ROOT", "eval_result"),
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
@@ -815,11 +880,26 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     "success": bool(self.success[env_idx]),
                     "score": episode_score,
                 }
+                if os.environ.get("SIM_SERVICE_PARENT_JOB_ID"):
+                    self.eval_result["details"][index].update(
+                        parent_job_id=os.environ["SIM_SERVICE_PARENT_JOB_ID"],
+                        shard_id=os.environ["SIM_SERVICE_SHARD_ID"],
+                    )
                 video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
-                self.save_video(env_idx, video_path, tag)
+                videos = self.save_video(env_idx, video_path, tag)
+                telemetry = self.telemetry.pop(env_idx, None)
+                if telemetry is not None:
+                    telemetry.save(
+                        os.path.join(self.save_dir, f"episode_{index:07d}.telemetry.json"),
+                        {"task": self.task_name, "env_config": self.config_name, "seed": int(self.eval_seed),
+                         "episode": int(index), "layout_id": int(self.env_seeds[env_idx])},
+                        videos,
+                    )
 
             # Drop streams for envs not saved this batch (e.g. unstable ones).
             self._abort_video_writers()
+            self.telemetry.clear()
+            self.telemetry_actions.clear()
 
             fail = self.episode_nums - success
             self.success_nums += success
@@ -869,16 +949,18 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def get_running_env_idx_list(self):
             return [idx for idx in range(self.num_envs) if not self.end_flag[idx]]
 
+        @profiled("video_append")
         def _stream_vision(self, env_idx, frame):
             """Append this env's per-camera RGB frames to its ffmpeg streams.
 
-            Only the vision ("color") data is recorded; writers are created
+            Vision ("color") writers are created
             lazily on the first frame (when the resolution is known) and write
             to temporary files until the episode outcome decides the name.
             """
             vision = frame.get("vision") if isinstance(frame, dict) else None
             if not vision:
-                return
+                return {}
+            frames = {}
             writers = self.video_writers.setdefault(env_idx, {})
             fps = self.obs_manager.collect_freq
             for cam_key, cam_data in vision.items():
@@ -893,6 +975,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     tmp_path = os.path.join(self._stream_dir, f"env{env_idx}_{cam_key}.tmp.mp4")
                     writers[cam_key] = VideoStreamWriter(tmp_path, height, width, channels, fps=fps)
                 writers[cam_key].append(color)
+                frames[cam_key] = writers[cam_key].n_frames - 1
+            return frames
 
         def _sweep_stream_dir(self):
             """Remove orphan temp videos left by a previous hard kill/crash."""
@@ -918,7 +1002,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     except Exception:
                         pass
 
+        @profiled("video_finalize")
         def save_video(self, env_idx, video_path, tag):
+            videos = {}
             writers = self.video_writers.pop(env_idx, {})
             for cam_key, writer in writers.items():
                 tmp_path = writer.out_path
@@ -931,6 +1017,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     continue
                 os.makedirs(os.path.dirname(final_path), exist_ok=True)
                 os.replace(tmp_path, final_path)
+                videos[cam_key] = {"path": os.path.basename(final_path), "fps": writer.fps}
                 print(
                     format_video_saved_message(
                         final_path,
@@ -940,6 +1027,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         writer.fps,
                     )
                 )
+            return videos
 
         def have_empty(self, env_idx_list=None):
             if env_idx_list is None:
