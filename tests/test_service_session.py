@@ -273,11 +273,12 @@ class ResidentContracts(unittest.TestCase):
             {"os":os, "super":lambda:SimpleNamespace(close=lambda:events.append("env"))})
         writer = SimpleNamespace(close=lambda **kwargs:events.append("video-close"))
         env = SimpleNamespace(video_writers={0:{"head":writer}},
+            stop_continuous_recording=lambda:events.append("video-clock-stop"),
             obs_manager=SimpleNamespace(reset=lambda:events.append("obs")),
             _abort_video_writers=lambda:self.fail("partial evidence cannot be deleted"))
         with patch.dict(os.environ, {"SIM_SERVICE_SESSION_ID":"a"*32}):
             close(env)
-        self.assertEqual(events, ["video-close","obs","env"])
+        self.assertEqual(events, ["video-clock-stop","video-close","obs","env"])
         self.assertEqual(env.video_writers, {})
 
     def test_failed_job_cleans_up_and_never_acknowledges_success(self):

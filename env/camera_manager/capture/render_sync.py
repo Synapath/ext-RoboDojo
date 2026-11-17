@@ -129,6 +129,7 @@ def wait_for_latest_cameras(
     capture_manager=None,
     min_passes: int = 1,
     max_passes: int = 16,
+    require_delivery: bool = False,
 ) -> int:
     """Render until the dispatcher has delivered ``min_passes`` new frames.
 
@@ -137,6 +138,8 @@ def wait_for_latest_cameras(
     delivery is required. Returns the number of ``env.render()`` calls made.
     """
     del capture_manager  # kept for call compatibility; the fence is global
+    if require_delivery and not zero_delay_active():
+        raise RuntimeError("Strict capture requires zero-delay Kit settings at launch")
     required = max(1, int(min_passes))
     if not zero_delay_active():
         _warn_missing_settings()
@@ -152,7 +155,10 @@ def wait_for_latest_cameras(
         env.render()
         passes += 1
         stamp = dispatcher_time()
-        if stamp is None or last_stamp is None:
+        if require_delivery:
+            if stamp is not None and stamp != last_stamp:
+                delivered += 1
+        elif stamp is None or last_stamp is None:
             # No dispatcher clock to watch: fall back to counting renders.
             delivered = passes
         elif stamp != last_stamp:
@@ -160,4 +166,6 @@ def wait_for_latest_cameras(
         last_stamp = stamp
         if delivered >= required:
             break
+    if require_delivery and delivered < required:
+        raise RuntimeError("Camera dispatcher delivered no fresh frame before capture limit")
     return passes

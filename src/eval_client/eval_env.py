@@ -20,6 +20,7 @@ from utils.save_file import VideoStreamWriter, format_video_saved_message, save_
 from utils.performance import profiled
 from utils.episode_telemetry import EpisodeTelemetry
 from utils.policy_execution import execution_client
+from utils.simulation_video_clock import SimulationVideoClock
 
 
 def _patch_websockets_proxy_compat():
@@ -133,6 +134,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             # Replaces the old full-episode frame cache; only vision frames are
             # streamed to disk as they arrive instead of buffered in RAM.
             self.video_writers: dict[int, dict[str, VideoStreamWriter]] = {}
+            self._recording_clock = None
+            self._continuous_video_used = False
+            self._recording_log = None
             self.telemetry_enabled = bool(os.environ.get("SIM_SERVICE_SESSION_ID"))
             self.telemetry = {}
             self.telemetry_actions = {}
@@ -220,9 +224,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self._bind_observations_after_reset = self.sim is not None
 
         def close(self):
+            self.stop_continuous_recording()
             getattr(self, "telemetry", {}).clear()
             getattr(self, "telemetry_actions", {}).clear()
-            if os.environ.get("SIM_SERVICE_SESSION_ID"):
+            if os.environ.get("SIM_SERVICE_SESSION_ID") or self._continuous_video_used:
                 # Interrupted service jobs retain partial videos as evidence.
                 for writers in self.video_writers.values():
                     for writer in writers.values():
@@ -238,6 +243,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.obs_manager.initialize(self)
 
         def reset(self, seed=None, options=None):
+            if self._recording_clock is not None:
+                raise RuntimeError("Stop/finalize continuous recording before resetting the episode")
             # Subsequent batches also reload layouts without _post_setup_scene.
             # Rebind descriptions after each soft reset, not only a new job.
             self._bind_observations_after_reset = self.sim is not None
@@ -323,7 +330,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data_list = []
             for env_idx in env_idx_list:
                 if not self.end_flag[env_idx] or last_frame:
-                    frames = self._stream_vision(env_idx, data[env_idx])
+                    frames = ({} if self._continuous_video_used else self._stream_vision(env_idx, data[env_idx]))
                     if self.telemetry_enabled:
                         if env_idx not in self.telemetry:
                             names = {
@@ -705,6 +712,79 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             for _ in range(decimation):
                 super().step(meta_control_list=meta_control_list)
                 self.sim_step(render=False)
+
+        def sim_step(self, render=True):
+            super().sim_step(render=render)
+            clock = getattr(self, "_recording_clock", None)
+            if clock is not None and clock.due(int(self.sim._sim_step_counter)):
+                self._capture_recording_frame()
+
+        def start_continuous_recording(self, metadata_path):
+            """Opt-in 25Hz (or configured frequency) capture, independent of policy reads.
+
+            Call after reset, before the first action. Launch Kit with the native
+            render_sync zero-delay arguments. A missing delivery or clock sample
+            fails closed instead of duplicating a stale frame.
+            """
+            from env.camera_manager.capture.render_sync import zero_delay_active
+            if self._recording_clock is not None or self._continuous_video_used:
+                raise RuntimeError("Continuous recording already started for this episode")
+            if any(self.video_writers.values()):
+                raise RuntimeError("Start continuous recording before the first legacy video frame")
+            if not zero_delay_active():
+                raise RuntimeError("Continuous recording requires zero-delay Kit settings")
+            clock = SimulationVideoClock(float(self.sim.physics_dt), float(self.obs_manager.collect_freq),
+                                         int(self.sim._sim_step_counter))
+            os.makedirs(os.path.dirname(os.path.abspath(metadata_path)), exist_ok=True)
+            self._recording_log = open(metadata_path, "x", encoding="utf-8")
+            self._recording_metadata_path = os.fspath(metadata_path)
+            self._recording_clock = clock
+            self._continuous_video_used = True
+            self.obs_manager.require_fresh_frames = True
+            self._capture_recording_frame()
+
+        def _capture_recording_frame(self):
+            clock = self._recording_clock
+            frame = int(self.sim._sim_step_counter)
+            if not clock.due(frame):
+                return
+            # get_obs_batch deliberately does not write video in this mode.
+            data = self.get_obs_batch(last_frame=True)
+            records = []
+            for item in data:
+                idx = item["env_idx"]
+                if self.end_flag[idx]:
+                    continue
+                indices = self._stream_vision(idx, item)
+                if not indices:
+                    raise RuntimeError("Continuous recording received no camera frames")
+                fingers = {robot.arm_name: self.robot_manager.get_end_effector_real_val(robot, [idx])[idx]
+                           for robot in self.robot_manager.robot_list
+                           if robot.type == "target" and robot.ee_type == "gripper"}
+                records.append({"env_idx": idx, "camera_video_indices": indices,
+                                "state": item["state"], "measured_finger_joints": fingers,
+                                "capture": item["additional_info"]["capture"]})
+            self._recording_log.write(json.dumps({
+                "video_sample": clock.frames, "physics_frame": frame,
+                "sim_elapsed_s": (frame-clock.start_frame)*clock.physics_dt,
+                "native_steps": list(self.take_action_cnt), "observations": records,
+            }, default=lambda value: value.tolist(), allow_nan=False) + "\n")
+            self._recording_log.flush()
+            clock.commit(frame)
+
+        def stop_continuous_recording(self):
+            clock = getattr(self, "_recording_clock", None)
+            if clock is None:
+                return None
+            result = clock.payload()
+            result["physics_stop_frame"] = int(self.sim._sim_step_counter)
+            if self._recording_log is not None:
+                self._recording_log.close()
+                self._recording_log = None
+            self._recording_clock = None
+            with open(self._recording_metadata_path + ".summary.json", "x", encoding="utf-8") as stream:
+                json.dump(result, stream, indent=2)
+            return result
 
         def _align_layout_success(self):
             for env_idx in range(self.num_envs):
