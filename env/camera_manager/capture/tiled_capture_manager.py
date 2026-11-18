@@ -199,8 +199,10 @@ class TiledCaptureManager:
         This function will be called when we close the environment.
         """
 
+        self.cleanup_warnings = []
         for camera in self.tiled_cameras:
             camera.close()
+            self.cleanup_warnings.extend(getattr(camera, "_cleanup_warnings", []))
         self.annotator.clear()
         self.annotator_type.clear()
         self.annotator_device.clear()

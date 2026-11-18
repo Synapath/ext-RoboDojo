@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import List
+import time
 
 import numpy as np
 
@@ -40,6 +41,9 @@ class ObsManager:
         # the entrypoints enable; render_sync adds one more if they are absent.
         self.capture_render_passes = int(self.obs_config.get("capture_render_passes", 1))
         self.capture_render_max_passes = int(self.obs_config.get("capture_render_max_passes", 16))
+        self.require_fresh_frames = bool(self.obs_config.get("require_fresh_frames", False))
+        self.capture_sequence = 0
+        self.last_capture = None
         if self.collect_freq > 0:
             self.collect_interval = 1.0 / (self.dt * self.collect_freq)
         else:
@@ -83,14 +87,35 @@ class ObsManager:
 
         Call this instead of a bare ``env.render()`` right before ``get_obs``.
         """
-        from env.camera_manager.capture.render_sync import wait_for_latest_cameras
+        from env.camera_manager.capture.render_sync import dispatcher_time, wait_for_latest_cameras
 
-        wait_for_latest_cameras(
+        backend = getattr(self.env.sim, "unwrapped", self.env.sim)
+        before = int(backend._sim_step_counter)
+        stamp = dispatcher_time()
+        passes = wait_for_latest_cameras(
             self.env,
             capture_manager=self.capture_manager,
             min_passes=self.capture_render_passes,
             max_passes=self.capture_render_max_passes,
+            require_delivery=self.require_fresh_frames,
         )
+        after = int(backend._sim_step_counter)
+        if before != after:
+            raise RuntimeError("Physics advanced during camera capture")
+        self.capture_sequence += 1
+        self.last_capture = {
+            "sequence": self.capture_sequence,
+            "physics_frame": after,
+            "physics_dt_s": float(backend.physics_dt),
+            "dispatcher_reference_before": stamp,
+            "dispatcher_reference_after": dispatcher_time(),
+            "render_passes": passes,
+            "strict_delivery": self.require_fresh_frames,
+            "read_wall_epoch_s": time.time(),
+            "read_wall_monotonic_ns": time.monotonic_ns(),
+            "clock_note": "dispatcher reference is not a sensor exposure timestamp",
+        }
+        return self.last_capture
 
     def get_obs(self, env_idx_list=None):  # batch
         if env_idx_list is None:
@@ -104,6 +129,7 @@ class ObsManager:
             obs[env_idx]["data_format_version"] = "v1.0"
             obs[env_idx]["additional_info"] = {
                 "frequency": self.collect_freq,
+                "capture": deepcopy(self.last_capture),
             }
             obs[env_idx]["instruction"] = self.instruction[env_idx]
         if self.camera_manager is not None and self.capture_manager is not None:
@@ -217,4 +243,12 @@ class ObsManager:
                 print(stack_trace)
                 print("[get_obs] Robot observation capture failed.")
                 raise e
+        if self.require_fresh_frames and self.camera_manager is not None:
+            for env_idx in env_idx_list:
+                expected = set(self.camera_manager.camera_names[env_idx])
+                actual = obs[env_idx]["vision"]
+                if set(actual) != expected or any(
+                    "color" not in actual[name] or actual[name]["color"].size == 0 for name in expected
+                ):
+                    raise RuntimeError("Strict capture did not return every configured RGB camera")
         return obs

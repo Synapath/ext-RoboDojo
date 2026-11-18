@@ -206,12 +206,15 @@ class CameraView(XFormPrim):
         """Clean up the sensor by detaching annotators and destroying render products, and removing related prims."""
         product = getattr(self, "_render_product", None)
         if product is not None:
-            for annotator in self._annotators.values():
-                annotator.detach([self._render_product_path])
+            from utils.camera_cleanup import release_render_product
+            annotators = dict(self._annotators)
+            path = self._render_product_path
+            # Clear ownership before releasing so a later __del__ is idempotent,
+            # even if an unexpected SDK error is propagated after cleanup.
             self._annotators.clear()
-            product.destroy()
             self._render_product = None
             self._render_product_path = None
+            self._cleanup_warnings = release_render_product(product, annotators, path)
 
     def close(self):
         self._clean_up_tiled_sensor()
